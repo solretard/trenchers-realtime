@@ -1,23 +1,23 @@
 """
-Trenchers Realtime — Slice 2: minimal PvP combat.
+Trenchers Realtime — Slice 2.1: PvP combat with netcode for real latency.
 
-Server-authoritative. Clients send only {input: dx,dy, aim, fire}. The server
-owns movement, bullets, hit detection, damage, deaths, respawns and the score.
-First to TARGET_KILLS wins the round, then it resets.
+Server-authoritative. Movement is applied as DISCRETE input steps (one move per
+input command) so the client can predict its own movement and reconcile exactly
+against the server. Each input carries a sequence number; the server echoes back
+the last seq it processed per player so the client knows what to reconcile.
 
 Protocol
-  client -> server : {"t":"input","dx":-1..1,"dy":-1..1,"aim":radians,"fire":bool}
+  client -> server : {"t":"input","seq":N,"dx":-1..1,"dy":-1..1,"aim":rad,"fire":bool}
                      {"t":"name","name":"..."}
   server -> client : {"t":"welcome","id","room","w","h"}
                      {"t":"state","phase","winner","target",
-                        "players":[{id,name,x,y,hp,aim,alive,kills}],
-                        "bullets":[{x,y}]}
+                        "players":[{id,name,x,y,hp,aim,alive,kills,seq}],
+                        "bullets":[{x,y,vx,vy}]}
 """
 
 import asyncio
 import json
 import math
-import os
 import random
 import uuid
 from contextlib import asynccontextmanager
@@ -25,10 +25,11 @@ from typing import Dict, List
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 
-# --- tunables ---
-TICK_HZ = 20
+# --- tunables (client mirrors SPEED and MOVE_STEP) ---
+TICK_HZ = 30
 DT = 1.0 / TICK_HZ
 SPEED = 230.0
+MOVE_STEP = 1.0 / 30.0       # seconds of movement applied per input command
 W, H = 960, 540
 MAX_PLAYERS = 8
 
@@ -43,26 +44,32 @@ TARGET_KILLS = 5
 RESET_DELAY = 5.0
 
 
+def clampx(v):
+    return min(W - 16, max(16, v))
+
+
+def clampy(v):
+    return min(H - 16, max(16, v))
+
+
 class Player:
     def __init__(self, pid, name, ws):
         self.id = pid
         self.name = name
         self.ws = ws
-        self.x = random.uniform(120, W - 120)
-        self.y = random.uniform(120, H - 120)
-        self.dx = 0.0
-        self.dy = 0.0
+        self.x = clampx(random.uniform(120, W - 120))
+        self.y = clampy(random.uniform(120, H - 120))
         self.aim = 0.0
-        self.fire = False
         self.hp = MAX_HP
         self.alive = True
         self.kills = 0
         self.fire_cd = 0.0
         self.respawn = 0.0
+        self.last_seq = 0
 
     def spawn(self):
-        self.x = random.uniform(120, W - 120)
-        self.y = random.uniform(120, H - 120)
+        self.x = clampx(random.uniform(120, W - 120))
+        self.y = clampy(random.uniform(120, H - 120))
         self.hp = MAX_HP
         self.alive = True
         self.fire_cd = 0.0
@@ -73,7 +80,7 @@ class Room:
         self.code = code
         self.players: Dict[str, Player] = {}
         self.bullets: List[dict] = []
-        self.phase = "play"      # "play" | "over"
+        self.phase = "play"
         self.winner = None
         self.reset_timer = 0.0
 
@@ -96,14 +103,36 @@ def get_room(code):
     return rooms[code]
 
 
+def apply_input(room: Room, p: Player, dx: float, dy: float, aim: float, fire: bool, seq: int):
+    """Process one input command immediately (discrete step), so client prediction
+    can mirror it exactly."""
+    mag = (dx * dx + dy * dy) ** 0.5
+    if mag > 1:
+        dx /= mag
+        dy /= mag
+    if p.alive:
+        p.x = clampx(p.x + dx * SPEED * MOVE_STEP)
+        p.y = clampy(p.y + dy * SPEED * MOVE_STEP)
+    p.aim = aim
+    if fire and p.alive and room.phase == "play" and p.fire_cd <= 0:
+        p.fire_cd = FIRE_CD
+        room.bullets.append({
+            "o": p.id,
+            "x": p.x + math.cos(aim) * 18,
+            "y": p.y + math.sin(aim) * 18,
+            "vx": math.cos(aim) * BULLET_SPEED,
+            "vy": math.sin(aim) * BULLET_SPEED,
+            "life": BULLET_LIFE,
+        })
+    p.last_seq = seq
+
+
 def step_room(room: Room):
-    # match reset countdown
     if room.phase == "over":
         room.reset_timer -= DT
         if room.reset_timer <= 0:
             room.reset_match()
 
-    # players: cooldowns, respawns, movement, firing
     for p in room.players.values():
         if p.fire_cd > 0:
             p.fire_cd -= DT
@@ -111,21 +140,7 @@ def step_room(room: Room):
             p.respawn -= DT
             if p.respawn <= 0:
                 p.spawn()
-            continue
-        p.x = min(W - 16, max(16, p.x + p.dx * SPEED * DT))
-        p.y = min(H - 16, max(16, p.y + p.dy * SPEED * DT))
-        if room.phase == "play" and p.fire and p.fire_cd <= 0:
-            p.fire_cd = FIRE_CD
-            room.bullets.append({
-                "o": p.id,
-                "x": p.x + math.cos(p.aim) * 18,
-                "y": p.y + math.sin(p.aim) * 18,
-                "vx": math.cos(p.aim) * BULLET_SPEED,
-                "vy": math.sin(p.aim) * BULLET_SPEED,
-                "life": BULLET_LIFE,
-            })
 
-    # bullets
     alive_bullets = []
     for b in room.bullets:
         b["x"] += b["vx"] * DT
@@ -164,10 +179,15 @@ def room_state(room: Room) -> str:
         "target": TARGET_KILLS,
         "players": [
             {"id": p.id, "name": p.name, "x": round(p.x, 1), "y": round(p.y, 1),
-             "hp": p.hp, "aim": round(p.aim, 3), "alive": p.alive, "kills": p.kills}
+             "hp": p.hp, "aim": round(p.aim, 3), "alive": p.alive,
+             "kills": p.kills, "seq": p.last_seq}
             for p in room.players.values()
         ],
-        "bullets": [{"x": round(b["x"], 1), "y": round(b["y"], 1)} for b in room.bullets],
+        "bullets": [
+            {"x": round(b["x"], 1), "y": round(b["y"], 1),
+             "vx": round(b["vx"], 1), "vy": round(b["vy"], 1)}
+            for b in room.bullets
+        ],
     })
 
 
@@ -201,12 +221,12 @@ async def lifespan(app: FastAPI):
         task.cancel()
 
 
-app = FastAPI(title="Trenchers Realtime", version="0.2.0", lifespan=lifespan)
+app = FastAPI(title="Trenchers Realtime", version="0.3.0", lifespan=lifespan)
 
 
 @app.get("/")
 def root():
-    return {"name": "Trenchers Realtime", "ok": True, "mode": "pvp"}
+    return {"name": "Trenchers Realtime", "ok": True, "mode": "pvp", "netcode": "predict+reconcile"}
 
 
 @app.get("/health")
@@ -236,16 +256,14 @@ async def ws_endpoint(ws: WebSocket, code: str):
                 continue
             kind = m.get("t")
             if kind == "input":
-                dx = float(m.get("dx", 0) or 0)
-                dy = float(m.get("dy", 0) or 0)
-                mag = (dx * dx + dy * dy) ** 0.5
-                if mag > 1:
-                    dx /= mag
-                    dy /= mag
-                player.dx = dx
-                player.dy = dy
-                player.aim = float(m.get("aim", player.aim) or 0)
-                player.fire = bool(m.get("fire", False))
+                apply_input(
+                    room, player,
+                    float(m.get("dx", 0) or 0),
+                    float(m.get("dy", 0) or 0),
+                    float(m.get("aim", player.aim) or 0),
+                    bool(m.get("fire", False)),
+                    int(m.get("seq", 0) or 0),
+                )
             elif kind == "name":
                 nm = str(m.get("name", ""))[:16].strip()
                 if nm:

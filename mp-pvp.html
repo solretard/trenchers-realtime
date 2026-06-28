@@ -58,7 +58,10 @@
 "use strict";
 // ===== CONFIG =====
 // Local: "ws://127.0.0.1:8000"   |   Railway (https): "wss://your-realtime.up.railway.app"
-const REALTIME_URL = "ws://127.0.0.1:8000";
+const REALTIME_URL = "wss://web-production-cd223.up.railway.app";
+
+// must match server
+const SPEED=230, MOVE_STEP=1/30, SEND_MS=33, INTERP_DELAY=100;
 
 const cv=document.getElementById('cv'),ctx=cv.getContext('2d');
 let W=960,H=540,scaleX=1,scaleY=1;
@@ -66,10 +69,19 @@ function resize(){const r=document.getElementById('wrap').getBoundingClientRect(
 addEventListener('resize',resize);resize();
 
 let ws=null,myId=null,connected=false;
-let snap={players:[],bullets:[],phase:'play',winner:null,target:5};
-let render={}; // id -> eased {x,y}
+let meta={phase:'play',winner:null,target:5};
+let lastPlayers=[];           // newest authoritative player list (scoreboard, hp, alive)
+let pred=null;                // my predicted position {x,y}
+let myAlive=true;
+let inputSeq=0;
+let pending=[];               // unacked inputs {seq,dx,dy}
+const buffers={};             // other players: id -> [{x,y,aim,t}]
+let bulletSet={list:[],t:0};  // latest bullets + receive time (for extrapolation)
 const keys={};
 const mouse={x:W/2,y:H/2,down:false};
+
+function clampx(v){return Math.min(W-16,Math.max(16,v));}
+function clampy(v){return Math.min(H-16,Math.max(16,v));}
 
 document.getElementById('urlNote').textContent='server: '+REALTIME_URL;
 function setStatus(t,on){document.getElementById('statusText').textContent=t;document.getElementById('status').classList.toggle('on',!!on);}
@@ -86,16 +98,43 @@ function join(){
   ws.onopen=()=>{connected=true;setStatus('connected · room '+room,true);document.getElementById('lobby').classList.add('hidden');if(name)ws.send(JSON.stringify({t:'name',name}));startInputLoop();};
   ws.onmessage=(ev)=>{let m;try{m=JSON.parse(ev.data);}catch(e){return;}
     if(m.t==='welcome'){myId=m.id;W=m.w||W;H=m.h||H;resize();}
-    else if(m.t==='state'){snap=m;
-      const seen={};
-      for(const p of m.players){seen[p.id]=1;if(!render[p.id])render[p.id]={x:p.x,y:p.y};}
-      for(const id in render){if(!seen[id])delete render[id];}
-    } else if(m.t==='full'){document.getElementById('err').textContent='room is full';}
+    else if(m.t==='state'){onState(m);}
+    else if(m.t==='full'){document.getElementById('err').textContent='room is full';}
   };
   ws.onclose=()=>{connected=false;setStatus('disconnected',false);};
   ws.onerror=()=>{document.getElementById('err').textContent='could not reach server — is it running?';setStatus('error',false);};
 }
 document.getElementById('joinBtn').addEventListener('click',join);
+
+function onState(m){
+  meta={phase:m.phase,winner:m.winner,target:m.target};
+  lastPlayers=m.players;
+  const now=performance.now();
+  const seen={};
+  for(const p of m.players){
+    seen[p.id]=1;
+    if(p.id===myId){
+      myAlive=p.alive;
+      // ----- reconciliation: trust server, replay unacked inputs -----
+      pending=pending.filter(i=>i.seq>p.seq);
+      pred={x:p.x,y:p.y};
+      if(p.alive){
+        for(const i of pending){
+          pred.x=clampx(pred.x+i.dx*SPEED*MOVE_STEP);
+          pred.y=clampy(pred.y+i.dy*SPEED*MOVE_STEP);
+        }
+      } else { pending=[]; }
+    } else {
+      // ----- buffer snapshots of others for interpolation -----
+      if(!buffers[p.id])buffers[p.id]=[];
+      const buf=buffers[p.id];
+      buf.push({x:p.x,y:p.y,aim:p.aim,t:now});
+      if(buf.length>24)buf.shift();
+    }
+  }
+  for(const id in buffers){if(!seen[id])delete buffers[id];}
+  bulletSet={list:m.bullets||[],t:now};
+}
 
 let inputTimer=null;
 function startInputLoop(){
@@ -107,11 +146,19 @@ function startInputLoop(){
     if(keys['s']||keys['arrowdown'])dy+=1;
     if(keys['a']||keys['arrowleft'])dx-=1;
     if(keys['d']||keys['arrowright'])dx+=1;
-    let aim=0;const me=render[myId];
-    if(me)aim=Math.atan2(mouse.y-me.y,mouse.x-me.x);
+    const aim=pred?Math.atan2(mouse.y-pred.y,mouse.x-pred.x):0;
     const fire=mouse.down||!!keys[' '];
-    ws.send(JSON.stringify({t:'input',dx,dy,aim,fire}));
-  },50);
+    inputSeq++;
+    ws.send(JSON.stringify({t:'input',seq:inputSeq,dx,dy,aim,fire}));
+    // ----- client-side prediction: move myself now -----
+    if(pred&&myAlive){
+      let nx=dx,ny=dy;const mg=Math.hypot(nx,ny);if(mg>1){nx/=mg;ny/=mg;}
+      pred.x=clampx(pred.x+nx*SPEED*MOVE_STEP);
+      pred.y=clampy(pred.y+ny*SPEED*MOVE_STEP);
+      pending.push({seq:inputSeq,dx:nx,dy:ny});
+      if(pending.length>120)pending.shift();
+    }
+  },SEND_MS);
 }
 
 addEventListener('keydown',e=>{keys[e.key.toLowerCase()]=true;if(e.key===' ')e.preventDefault();});
@@ -121,46 +168,75 @@ cv.addEventListener('mousemove',e=>{const p=rel(e);mouse.x=p.x;mouse.y=p.y;});
 cv.addEventListener('mousedown',()=>{mouse.down=true;});
 addEventListener('mouseup',()=>{mouse.down=false;});
 
+// interpolate an other-player buffer at render time (now - delay)
+function sampleBuffer(buf,rt){
+  if(buf.length===0)return null;
+  if(rt<=buf[0].t)return buf[0];
+  if(rt>=buf[buf.length-1].t)return buf[buf.length-1];
+  for(let i=0;i<buf.length-1;i++){
+    const a=buf[i],b=buf[i+1];
+    if(rt>=a.t&&rt<=b.t){
+      const f=(rt-a.t)/(b.t-a.t||1);
+      let da=b.aim-a.aim;while(da>Math.PI)da-=2*Math.PI;while(da<-Math.PI)da+=2*Math.PI;
+      return{x:a.x+(b.x-a.x)*f,y:a.y+(b.y-a.y)*f,aim:a.aim+da*f};
+    }
+  }
+  return buf[buf.length-1];
+}
+
+function drawPlayer(x,y,aim,hp,alive,name,me){
+  if(!alive){
+    ctx.globalAlpha=0.35;ctx.fillStyle=me?'#e7c87e':'#ff5a26';
+    ctx.beginPath();ctx.arc(x,y,13,0,6.3);ctx.fill();ctx.globalAlpha=1;
+    ctx.fillStyle='#9a9079';ctx.font='700 10px Oswald';ctx.textAlign='center';ctx.fillText('RESPAWNING',x,y-20);return;
+  }
+  ctx.fillStyle='rgba(0,0,0,0.3)';ctx.beginPath();ctx.ellipse(x,y+15,12,5,0,0,6.3);ctx.fill();
+  ctx.strokeStyle=me?'#e7c87e':'#ffae8c';ctx.lineWidth=4;ctx.beginPath();ctx.moveTo(x,y);ctx.lineTo(x+Math.cos(aim)*20,y+Math.sin(aim)*20);ctx.stroke();
+  ctx.fillStyle=me?'#e7c87e':'#ff5a26';ctx.beginPath();ctx.arc(x,y,13,0,6.3);ctx.fill();
+  ctx.fillStyle='#100f0a';ctx.beginPath();ctx.arc(x,y,5,0,6.3);ctx.fill();
+  const hpw=30;ctx.fillStyle='#000';ctx.fillRect(x-hpw/2,y-26,hpw,4);
+  ctx.fillStyle=hp>40?'#9bb04f':'#c0392b';ctx.fillRect(x-hpw/2,y-26,hpw*Math.max(0,hp)/100,4);
+  ctx.fillStyle=me?'#e7c87e':'#ffae8c';ctx.font='700 12px Oswald';ctx.textAlign='center';
+  ctx.fillText((name||'?')+(me?' (you)':''),x,y-31);
+}
+
 function draw(){
   ctx.clearRect(0,0,cv.width,cv.height);
   ctx.strokeStyle='rgba(200,155,74,0.06)';ctx.lineWidth=1;
   for(let x=0;x<=W;x+=48){ctx.beginPath();ctx.moveTo(x*scaleX,0);ctx.lineTo(x*scaleX,cv.height);ctx.stroke();}
   for(let y=0;y<=H;y+=48){ctx.beginPath();ctx.moveTo(0,y*scaleY);ctx.lineTo(cv.width,y*scaleY);ctx.stroke();}
 
-  // bullets
+  const now=performance.now();
+  // bullets: extrapolate from last snapshot using their velocity
+  const dtb=Math.min(0.12,(now-bulletSet.t)/1000);
   ctx.fillStyle='#ffae5c';
-  for(const b of snap.bullets){ctx.beginPath();ctx.arc(b.x*scaleX,b.y*scaleY,3.5*scaleX,0,6.3);ctx.fill();}
+  for(const b of bulletSet.list){
+    const bx=(b.x+(b.vx||0)*dtb)*scaleX, by=(b.y+(b.vy||0)*dtb)*scaleY;
+    ctx.beginPath();ctx.arc(bx,by,3.5*scaleX,0,6.3);ctx.fill();
+  }
 
-  // players
-  for(const p of snap.players){
-    if(!render[p.id])render[p.id]={x:p.x,y:p.y};
-    render[p.id].x+=(p.x-render[p.id].x)*0.35;
-    render[p.id].y+=(p.y-render[p.id].y)*0.35;
-    const x=render[p.id].x*scaleX,y=render[p.id].y*scaleY,me=(p.id===myId);
-    if(!p.alive){ctx.globalAlpha=0.35;ctx.fillStyle=me?'#e7c87e':'#ff5a26';ctx.beginPath();ctx.arc(x,y,13,0,6.3);ctx.fill();ctx.globalAlpha=1;
-      ctx.fillStyle='#9a9079';ctx.font='700 10px Oswald';ctx.textAlign='center';ctx.fillText('RESPAWNING',x,y-20);continue;}
-    // shadow
-    ctx.fillStyle='rgba(0,0,0,0.3)';ctx.beginPath();ctx.ellipse(x,y+15,12,5,0,0,6.3);ctx.fill();
-    // gun line toward aim
-    ctx.strokeStyle=me?'#e7c87e':'#ffae8c';ctx.lineWidth=4;ctx.beginPath();ctx.moveTo(x,y);ctx.lineTo(x+Math.cos(p.aim)*20,y+Math.sin(p.aim)*20);ctx.stroke();
-    // body
-    ctx.fillStyle=me?'#e7c87e':'#ff5a26';ctx.beginPath();ctx.arc(x,y,13,0,6.3);ctx.fill();
-    ctx.fillStyle='#100f0a';ctx.beginPath();ctx.arc(x,y,5,0,6.3);ctx.fill();
-    // hp bar
-    const hpw=30;ctx.fillStyle='#000';ctx.fillRect(x-hpw/2,y-26,hpw,4);
-    ctx.fillStyle=p.hp>40?'#9bb04f':'#c0392b';ctx.fillRect(x-hpw/2,y-26,hpw*Math.max(0,p.hp)/100,4);
-    // name
-    ctx.fillStyle=me?'#e7c87e':'#ffae8c';ctx.font='700 12px Oswald';ctx.textAlign='center';
-    ctx.fillText((p.name||'?')+(me?' (you)':''),x,y-31);
+  const rt=now-INTERP_DELAY;
+  const byId={};for(const p of lastPlayers)byId[p.id]=p;
+  // other players (interpolated)
+  for(const p of lastPlayers){
+    if(p.id===myId)continue;
+    const s=sampleBuffer(buffers[p.id]||[],rt)||{x:p.x,y:p.y,aim:p.aim};
+    drawPlayer(s.x*scaleX,s.y*scaleY,s.aim,p.hp,p.alive,p.name,false);
+  }
+  // me (predicted position, instant local aim)
+  if(myId&&byId[myId]){
+    const mp=byId[myId];
+    const px=(pred?pred.x:mp.x), py=(pred?pred.y:mp.y);
+    const aim=pred?Math.atan2(mouse.y-pred.y,mouse.x-pred.x):mp.aim;
+    drawPlayer(px*scaleX,py*scaleY,aim,mp.hp,mp.alive,mp.name,true);
   }
 
   // scoreboard
-  const rows=[...snap.players].sort((a,b)=>b.kills-a.kills).map(p=>`<div class="r"><span>${p.name||'?'}${p.id===myId?' (you)':''}</span><b>${p.kills}</b></div>`).join('');
+  const rows=[...lastPlayers].sort((a,b)=>b.kills-a.kills).map(p=>`<div class="r"><span>${p.name||'?'}${p.id===myId?' (you)':''}</span><b>${p.kills}</b></div>`).join('');
   document.getElementById('scoreRows').innerHTML=rows||'<div class="r"><span>waiting…</span></div>';
 
-  // win banner
   const bn=document.getElementById('banner');
-  if(snap.phase==='over'&&snap.winner){bn.style.display='block';document.getElementById('bannerW').textContent=snap.winner+' WINS';document.getElementById('bannerS').textContent='new round starting…';}
+  if(meta.phase==='over'&&meta.winner){bn.style.display='block';document.getElementById('bannerW').textContent=meta.winner+' WINS';document.getElementById('bannerS').textContent='new round starting…';}
   else bn.style.display='none';
 
   requestAnimationFrame(draw);
