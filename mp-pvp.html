@@ -32,6 +32,12 @@
   .tok .gt{font-size:8px;color:var(--bone-dim);letter-spacing:1px;}
   .tok.rug .mc{color:var(--blood);}
   #gun{position:absolute;bottom:26px;left:50%;transform:translateX(-50%);z-index:5;font-family:'Oswald';font-weight:700;font-size:13px;letter-spacing:2px;color:var(--brass-br);}
+  #war{position:absolute;top:8px;left:8px;margin-top:26px;z-index:5;font-size:11px;background:rgba(16,15,10,.85);border:1px solid rgba(200,155,74,.3);padding:6px 9px;min-width:128px;}
+  #war .h{font-family:'Oswald';font-weight:700;font-size:9px;letter-spacing:2px;color:var(--bone-dim);margin-bottom:3px;}
+  #war .r{display:flex;justify-content:space-between;gap:10px;line-height:1.5;}
+  .fchips{display:flex;gap:6px;flex-wrap:wrap;justify-content:center;max-width:340px;}
+  .fchip{cursor:pointer;border:1px solid rgba(200,155,74,.4);background:#0c0b07;color:var(--bone);font-family:'Oswald';font-weight:600;font-size:12px;letter-spacing:1px;padding:7px 13px;}
+  .fchip.sel{color:#100f0a;}
   #lobby{position:absolute;inset:0;z-index:8;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;padding:24px;text-align:center;background:radial-gradient(ellipse at 50% 30%,rgba(40,36,22,.5),rgba(8,7,4,.95) 75%);}
   #lobby.hidden{display:none;}
   .title{font-family:'Oswald';font-weight:700;font-size:clamp(34px,9vw,60px);letter-spacing:3px;line-height:.9;}
@@ -51,13 +57,15 @@
   <div id="score"><div class="h">KILLS</div><div id="scoreRows"></div></div>
   <div id="market"></div>
   <div id="gun"></div>
+  <div id="war" style="display:none"><div class="h">FACTION WAR</div><div id="warRows"></div></div>
   <div id="banner"><div class="w" id="bannerW"></div><div class="s" id="bannerS"></div></div>
   <div id="hint">WASD move · mouse aim · hold CLICK / SPACE fire · TAP A TOKEN to arm your gun · first to 5 wins</div>
 
   <div id="lobby">
     <div class="title">TREN<span class="b">CHERS</span> · PVP</div>
-    <div class="sub">Slice 2 — combat. Open in two windows, join the same room code, and shoot each other. First to 5 kills wins. Move with WASD, aim with the mouse, hold click or space to fire.</div>
+    <div class="sub">Pick your faction, then enter the trench. Open in two windows or send the link to a friend, join the same room code, and fight. Winning a round scores a point for your faction in the war.</div>
     <input id="nameIn" maxlength="16" placeholder="CALLSIGN" />
+    <div class="fchips" id="fchips"></div>
     <input id="roomIn" maxlength="8" placeholder="ROOM CODE" />
     <button class="btn" id="joinBtn">ENTER THE TRENCH</button>
     <div class="err" id="err"></div>
@@ -85,6 +93,11 @@ let meta={phase:'play',winner:null,target:5};
 let lastPlayers=[];           // newest authoritative player list (scoreboard, hp, alive)
 let market=[];                // [{sym,mcap,tier,rugged}]
 const GUN_NAMES=['PISTOL','SMG','RIFLE','LASER','CANNON'];
+// factions (Version A: chosen in lobby; later swap to NFT-derived)
+const FACTIONS=['DIAMONDS','APES','SNIPERS','COPERS'];
+const FCOLOR={DIAMONDS:'#39c6e0',APES:'#ff7a3c',SNIPERS:'#9bb04f',COPERS:'#b07fe0','—':'#9a9079'};
+let myFaction='DIAMONDS';
+let war=[];                   // [{faction,points}]
 let pred=null;                // my predicted position {x,y}
 let myAlive=true;
 let inputSeq=0;
@@ -100,6 +113,22 @@ function clampy(v){return Math.min(H-16,Math.max(16,v));}
 document.getElementById('urlNote').textContent='server: '+REALTIME_URL;
 function setStatus(t,on){document.getElementById('statusText').textContent=t;document.getElementById('status').classList.toggle('on',!!on);}
 
+// faction picker
+(function buildFactionPicker(){
+  const wrap=document.getElementById('fchips');
+  wrap.innerHTML=FACTIONS.map(f=>`<div class="fchip" data-f="${f}">${f}</div>`).join('');
+  function paint(){
+    for(const c of wrap.querySelectorAll('.fchip')){
+      const f=c.getAttribute('data-f'),sel=(f===myFaction);
+      c.classList.toggle('sel',sel);
+      c.style.background=sel?FCOLOR[f]:'#0c0b07';
+      c.style.borderColor=FCOLOR[f];
+    }
+  }
+  wrap.addEventListener('click',e=>{const c=e.target.closest('.fchip');if(!c)return;myFaction=c.getAttribute('data-f');paint();});
+  paint();
+})();
+
 function join(){
   const room=(document.getElementById('roomIn').value||'').trim().toUpperCase();
   const name=(document.getElementById('nameIn').value||'').trim();
@@ -109,7 +138,7 @@ function join(){
   const url=REALTIME_URL.replace(/\/$/,'')+'/ws/'+encodeURIComponent(room);
   setStatus('connecting…',false);
   try{ws=new WebSocket(url);}catch(e){err.textContent='bad server URL';return;}
-  ws.onopen=()=>{connected=true;setStatus('connected · room '+room,true);document.getElementById('lobby').classList.add('hidden');if(name)ws.send(JSON.stringify({t:'name',name}));startInputLoop();};
+  ws.onopen=()=>{connected=true;setStatus('connected · room '+room,true);document.getElementById('lobby').classList.add('hidden');document.getElementById('war').style.display='block';if(name)ws.send(JSON.stringify({t:'name',name}));ws.send(JSON.stringify({t:'faction',f:myFaction}));startInputLoop();};
   ws.onmessage=(ev)=>{let m;try{m=JSON.parse(ev.data);}catch(e){return;}
     if(m.t==='welcome'){myId=m.id;W=m.w||W;H=m.h||H;resize();}
     else if(m.t==='state'){onState(m);}
@@ -136,6 +165,9 @@ function renderMarket(){
   const g=document.getElementById('gun');
   if(me){ const tn=me.tier>=0?GUN_NAMES[me.tier]:'UNARMED'; g.textContent='GUN: '+tn+(myTok?' · '+myTok:''); }
   else g.textContent='';
+  // faction war standings
+  const wr=[...war].sort((a,b)=>b.points-a.points).map(w=>`<div class="r"><span style="color:${FCOLOR[w.faction]||'#e8e0cc'}">${w.faction}</span><b>${w.points}</b></div>`).join('');
+  const warEl=document.getElementById('warRows');if(warEl)warEl.innerHTML=wr;
 }
 // delegated click: one listener, survives innerHTML refreshes
 document.getElementById('market').addEventListener('click',e=>{
@@ -149,6 +181,7 @@ function onState(m){
   meta={phase:m.phase,winner:m.winner,target:m.target};
   lastPlayers=m.players;
   market=m.market||[];
+  war=m.war||[];
   const now=performance.now();
   const seen={};
   for(const p of m.players){
@@ -224,19 +257,21 @@ function sampleBuffer(buf,rt){
   return buf[buf.length-1];
 }
 
-function drawPlayer(x,y,aim,hp,alive,name,me){
+function drawPlayer(x,y,aim,hp,alive,name,me,faction){
+  const col=FCOLOR[faction]||(me?'#e7c87e':'#ff5a26');
   if(!alive){
-    ctx.globalAlpha=0.35;ctx.fillStyle=me?'#e7c87e':'#ff5a26';
+    ctx.globalAlpha=0.3;ctx.fillStyle=col;
     ctx.beginPath();ctx.arc(x,y,13,0,6.3);ctx.fill();ctx.globalAlpha=1;
     ctx.fillStyle='#9a9079';ctx.font='700 10px Oswald';ctx.textAlign='center';ctx.fillText('RESPAWNING',x,y-20);return;
   }
   ctx.fillStyle='rgba(0,0,0,0.3)';ctx.beginPath();ctx.ellipse(x,y+15,12,5,0,0,6.3);ctx.fill();
-  ctx.strokeStyle=me?'#e7c87e':'#ffae8c';ctx.lineWidth=4;ctx.beginPath();ctx.moveTo(x,y);ctx.lineTo(x+Math.cos(aim)*20,y+Math.sin(aim)*20);ctx.stroke();
-  ctx.fillStyle=me?'#e7c87e':'#ff5a26';ctx.beginPath();ctx.arc(x,y,13,0,6.3);ctx.fill();
+  ctx.strokeStyle=col;ctx.lineWidth=4;ctx.beginPath();ctx.moveTo(x,y);ctx.lineTo(x+Math.cos(aim)*20,y+Math.sin(aim)*20);ctx.stroke();
+  ctx.fillStyle=col;ctx.beginPath();ctx.arc(x,y,13,0,6.3);ctx.fill();
+  if(me){ctx.strokeStyle='#e7c87e';ctx.lineWidth=2;ctx.beginPath();ctx.arc(x,y,16,0,6.3);ctx.stroke();}
   ctx.fillStyle='#100f0a';ctx.beginPath();ctx.arc(x,y,5,0,6.3);ctx.fill();
   const hpw=30;ctx.fillStyle='#000';ctx.fillRect(x-hpw/2,y-26,hpw,4);
   ctx.fillStyle=hp>40?'#9bb04f':'#c0392b';ctx.fillRect(x-hpw/2,y-26,hpw*Math.max(0,hp)/100,4);
-  ctx.fillStyle=me?'#e7c87e':'#ffae8c';ctx.font='700 12px Oswald';ctx.textAlign='center';
+  ctx.fillStyle=col;ctx.font='700 12px Oswald';ctx.textAlign='center';
   ctx.fillText((name||'?')+(me?' (you)':''),x,y-31);
 }
 
@@ -261,14 +296,14 @@ function draw(){
   for(const p of lastPlayers){
     if(p.id===myId)continue;
     const s=sampleBuffer(buffers[p.id]||[],rt)||{x:p.x,y:p.y,aim:p.aim};
-    drawPlayer(s.x*scaleX,s.y*scaleY,s.aim,p.hp,p.alive,p.name,false);
+    drawPlayer(s.x*scaleX,s.y*scaleY,s.aim,p.hp,p.alive,p.name,false,p.faction);
   }
   // me (predicted position, instant local aim)
   if(myId&&byId[myId]){
     const mp=byId[myId];
     const px=(pred?pred.x:mp.x), py=(pred?pred.y:mp.y);
     const aim=pred?Math.atan2(mouse.y-pred.y,mouse.x-pred.x):mp.aim;
-    drawPlayer(px*scaleX,py*scaleY,aim,mp.hp,mp.alive,mp.name,true);
+    drawPlayer(px*scaleX,py*scaleY,aim,mp.hp,mp.alive,mp.name,true,mp.faction);
   }
 
   // scoreboard

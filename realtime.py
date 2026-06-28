@@ -33,7 +33,7 @@ MAX_PLAYERS = 8
 
 MAX_HP = 100
 BULLET_SPEED = 540.0
-BULLET_LIFE = 1.1
+BULLET_LIFE = 2.4
 PLAYER_HIT_R = 18.0
 RESPAWN = 2.0
 TARGET_KILLS = 5
@@ -60,6 +60,20 @@ GUNS = [
     {"name": "CANNON", "cd": 0.70, "dmg": 14, "pellets": 5, "spread": 0.34},
 ]
 DEFAULT_GUN = {"name": "SWORD-PISTOL", "cd": 0.55, "dmg": 12, "pellets": 1, "spread": 0.0}
+
+# --- factions (Version A: faction is the player's lobby choice) ---
+FACTIONS = ["DIAMONDS", "APES", "SNIPERS", "COPERS"]
+
+
+def resolve_faction(player) -> str:
+    """The ONE swap-point for the NFT hook.
+
+    Version A (now): faction is whatever the player chose in the lobby.
+    Version B (later, at mint): replace the body of this function to read the
+    player's faction from the Trenchers NFT held in their connected wallet.
+    Nothing else in the game needs to change.
+    """
+    return player.chosen_faction or "—"
 
 
 def clampx(v): return min(W - 16, max(16, v))
@@ -107,6 +121,7 @@ class Player:
         self.respawn = 0.0
         self.last_seq = 0
         self.equipped: Optional[str] = None
+        self.chosen_faction: Optional[str] = None
 
     def spawn(self):
         self.x = clampx(random.uniform(120, W - 120))
@@ -125,6 +140,7 @@ class Room:
         self.winner = None
         self.reset_timer = 0.0
         self.market: Dict[str, Token] = {s: Token(s) for s in MARKET_SYMS}
+        self.war: Dict[str, int] = {f: 0 for f in FACTIONS}
 
     def reset_match(self):
         self.bullets.clear()
@@ -228,6 +244,9 @@ def step_room(room: Room):
                             room.phase = "over"
                             room.winner = shooter.name
                             room.reset_timer = RESET_DELAY
+                            fac = resolve_faction(shooter)
+                            if fac in room.war:
+                                room.war[fac] += 1
                 break
         if not hit:
             alive_bullets.append(b)
@@ -245,11 +264,13 @@ def room_state(room: Room) -> str:
              "tier": (-1 if tok.rugged else tier_of(tok.mcap)), "rugged": tok.rugged}
             for tok in room.market.values()
         ],
+        "war": [{"faction": f, "points": room.war[f]} for f in FACTIONS],
         "players": [
             {"id": p.id, "name": p.name, "x": round(p.x, 1), "y": round(p.y, 1),
              "hp": p.hp, "aim": round(p.aim, 3), "alive": p.alive,
              "kills": p.kills, "seq": p.last_seq,
-             "tok": p.equipped, "tier": player_tier(room, p)}
+             "tok": p.equipped, "tier": player_tier(room, p),
+             "faction": resolve_faction(p)}
             for p in room.players.values()
         ],
         "bullets": [
@@ -290,13 +311,13 @@ async def lifespan(app: FastAPI):
         task.cancel()
 
 
-app = FastAPI(title="Trenchers Realtime", version="0.4.0", lifespan=lifespan)
+app = FastAPI(title="Trenchers Realtime", version="0.5.0", lifespan=lifespan)
 
 
 @app.get("/")
 def root():
     return {"name": "Trenchers Realtime", "ok": True, "mode": "pvp",
-            "netcode": "predict+reconcile", "feature": "token-guns"}
+            "netcode": "predict+reconcile", "feature": "token-guns+factions"}
 
 
 @app.get("/health")
@@ -339,6 +360,10 @@ async def ws_endpoint(ws: WebSocket, code: str):
                 tok = room.market.get(sym)
                 if tok and not tok.rugged:
                     player.equipped = sym
+            elif kind == "faction":
+                f = str(m.get("f", "")).upper()
+                if f in FACTIONS:
+                    player.chosen_faction = f
             elif kind == "name":
                 nm = str(m.get("name", ""))[:16].strip()
                 if nm:
