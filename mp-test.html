@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Trenchers — Realtime Test</title>
+<link href="https://fonts.googleapis.com/css2?family=Oswald:wght@600;700&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">
+<style>
+  :root{--mud-900:#100f0a;--mud-700:#211e15;--brass:#c89b4a;--brass-br:#e7c87e;--bone:#e8e0cc;--bone-dim:#9a9079;--flare:#ff5a26;--cyan:#39c6e0;--gain:#9bb04f;}
+  *{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent;}
+  html,body{height:100%;background:var(--mud-900);overflow:hidden;font-family:'Space Mono',monospace;color:var(--bone);}
+  body{display:flex;align-items:center;justify-content:center;touch-action:none;user-select:none;}
+  #wrap{position:relative;width:100vw;height:100vh;max-width:960px;max-height:560px;}
+  canvas{display:block;width:100%;height:100%;background:#16140d;image-rendering:auto;}
+  #status{position:absolute;top:8px;left:8px;z-index:5;font-size:11px;letter-spacing:1px;background:rgba(16,15,10,.85);border:1px solid rgba(200,155,74,.3);padding:5px 9px;}
+  #status .dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--flare);margin-right:6px;vertical-align:middle;}
+  #status.on .dot{background:var(--gain);}
+  #hint{position:absolute;bottom:8px;left:50%;transform:translateX(-50%);z-index:5;font-size:10px;color:var(--bone-dim);letter-spacing:1px;}
+  /* lobby */
+  #lobby{position:absolute;inset:0;z-index:8;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;padding:24px;text-align:center;background:radial-gradient(ellipse at 50% 30%,rgba(40,36,22,.5),rgba(8,7,4,.95) 75%);}
+  #lobby.hidden{display:none;}
+  .title{font-family:'Oswald';font-weight:700;font-size:clamp(34px,9vw,60px);letter-spacing:3px;line-height:.9;}
+  .title .b{color:var(--brass-br);}
+  .sub{font-size:11px;color:var(--bone-dim);letter-spacing:1px;max-width:340px;line-height:1.7;}
+  input{background:#0c0b07;border:1px solid rgba(200,155,74,.4);color:var(--bone);font-family:'Space Mono';font-size:15px;padding:11px 14px;letter-spacing:2px;text-transform:uppercase;text-align:center;width:220px;}
+  .btn{cursor:pointer;font-family:'Oswald';font-weight:600;font-size:16px;letter-spacing:3px;color:var(--mud-900);background:var(--brass);border:none;padding:12px 30px;text-transform:uppercase;box-shadow:0 4px 0 #6e4f1d;}
+  .btn:active{transform:translateY(3px);box-shadow:0 1px 0 #6e4f1d;}
+  .row{display:flex;gap:8px;align-items:center;}
+  .small{font-size:10px;color:var(--bone-dim);}
+  .err{color:var(--flare);font-size:11px;min-height:14px;}
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="cv"></canvas>
+  <div id="status"><span class="dot"></span><span id="statusText">offline</span></div>
+  <div id="hint">drag or WASD to move · share the room code with a friend to test</div>
+
+  <div id="lobby">
+    <div class="title">TREN<span class="b">CHERS</span></div>
+    <div class="sub">Realtime test — Slice 1. Two players, one room, moving live. Open this page in two windows (or send the link to a friend), join the same room code, and you should see each other move.</div>
+    <input id="nameIn" maxlength="16" placeholder="CALLSIGN" />
+    <input id="roomIn" maxlength="8" placeholder="ROOM CODE" />
+    <button class="btn" id="joinBtn">ENTER THE TRENCH</button>
+    <div class="err" id="err"></div>
+    <div class="small" id="urlNote"></div>
+  </div>
+</div>
+
+<script>
+(()=>{
+"use strict";
+// ===== CONFIG =====
+// Local testing: "ws://127.0.0.1:8000"
+// Deployed on Railway (https): "wss://YOUR-REALTIME.up.railway.app"
+const REALTIME_URL = "ws://127.0.0.1:8000";
+
+const cv=document.getElementById('cv'),ctx=cv.getContext('2d');
+let W=960,H=540,scaleX=1,scaleY=1;
+function resize(){const r=document.getElementById('wrap').getBoundingClientRect();cv.width=r.width;cv.height=r.height;scaleX=cv.width/W;scaleY=cv.height/H;}
+addEventListener('resize',resize);resize();
+
+let ws=null, myId=null, connected=false;
+let targets={};   // id -> {x,y,name} latest from server
+let render={};    // id -> {x,y} eased for smooth drawing
+const keys={};
+const ptr={down:false,x:0,y:0};
+
+document.getElementById('urlNote').textContent='server: '+REALTIME_URL;
+
+function setStatus(txt,on){document.getElementById('statusText').textContent=txt;document.getElementById('status').classList.toggle('on',!!on);}
+
+function join(){
+  const room=(document.getElementById('roomIn').value||'').trim().toUpperCase();
+  const name=(document.getElementById('nameIn').value||'').trim();
+  const err=document.getElementById('err');
+  if(!room){err.textContent='enter a room code';return;}
+  err.textContent='';
+  const url=REALTIME_URL.replace(/\/$/,'')+'/ws/'+encodeURIComponent(room);
+  setStatus('connecting…',false);
+  try{ ws=new WebSocket(url); }
+  catch(e){ err.textContent='bad server URL'; return; }
+
+  ws.onopen=()=>{ connected=true; setStatus('connected · room '+room,true);
+    document.getElementById('lobby').classList.add('hidden');
+    if(name) ws.send(JSON.stringify({t:'name',name}));
+    startInputLoop();
+  };
+  ws.onmessage=(ev)=>{
+    let m; try{m=JSON.parse(ev.data);}catch(e){return;}
+    if(m.t==='welcome'){ myId=m.id; W=m.w||W; H=m.h||H; resize(); }
+    else if(m.t==='state'){
+      const seen={};
+      for(const p of m.players){ targets[p.id]={x:p.x,y:p.y,name:p.name}; seen[p.id]=1;
+        if(!render[p.id]) render[p.id]={x:p.x,y:p.y}; }
+      for(const id in targets){ if(!seen[id]){ delete targets[id]; delete render[id]; } }
+    } else if(m.t==='full'){ document.getElementById('err').textContent='room is full'; }
+  };
+  ws.onclose=()=>{ connected=false; setStatus('disconnected',false); };
+  ws.onerror=()=>{ document.getElementById('err').textContent='could not reach server — is it running?'; setStatus('error',false); };
+}
+document.getElementById('joinBtn').addEventListener('click',join);
+
+// input -> server at 20Hz
+let inputTimer=null;
+function startInputLoop(){
+  if(inputTimer)clearInterval(inputTimer);
+  inputTimer=setInterval(()=>{
+    if(!connected||!ws||ws.readyState!==1)return;
+    let dx=0,dy=0;
+    if(keys['w']||keys['arrowup'])dy-=1;
+    if(keys['s']||keys['arrowdown'])dy+=1;
+    if(keys['a']||keys['arrowleft'])dx-=1;
+    if(keys['d']||keys['arrowright'])dx+=1;
+    if(ptr.down){const me=render[myId];if(me){const ddx=ptr.x-me.x,ddy=ptr.y-me.y,d=Math.hypot(ddx,ddy);if(d>8){dx=ddx/d;dy=ddy/d;}}}
+    ws.send(JSON.stringify({t:'input',dx,dy}));
+  },50);
+}
+
+addEventListener('keydown',e=>{keys[e.key.toLowerCase()]=true;});
+addEventListener('keyup',e=>{keys[e.key.toLowerCase()]=false;});
+function rel(e){const r=cv.getBoundingClientRect();return{x:(e.clientX-r.left)/scaleX,y:(e.clientY-r.top)/scaleY};}
+cv.addEventListener('pointerdown',e=>{ptr.down=true;const p=rel(e);ptr.x=p.x;ptr.y=p.y;});
+cv.addEventListener('pointermove',e=>{const p=rel(e);ptr.x=p.x;ptr.y=p.y;});
+addEventListener('pointerup',()=>{ptr.down=false;});
+
+// render loop with easing toward server truth
+function draw(){
+  ctx.clearRect(0,0,cv.width,cv.height);
+  // floor grid
+  ctx.strokeStyle='rgba(200,155,74,0.06)';ctx.lineWidth=1;
+  for(let x=0;x<=W;x+=48){ctx.beginPath();ctx.moveTo(x*scaleX,0);ctx.lineTo(x*scaleX,cv.height);ctx.stroke();}
+  for(let y=0;y<=H;y+=48){ctx.beginPath();ctx.moveTo(0,y*scaleY);ctx.lineTo(cv.width,y*scaleY);ctx.stroke();}
+  // ease render toward targets
+  for(const id in targets){
+    if(!render[id])render[id]={x:targets[id].x,y:targets[id].y};
+    render[id].x+=(targets[id].x-render[id].x)*0.3;
+    render[id].y+=(targets[id].y-render[id].y)*0.3;
+  }
+  // draw players
+  for(const id in render){
+    const p=render[id],t=targets[id];if(!t)continue;
+    const x=p.x*scaleX,y=p.y*scaleY,me=(id===myId);
+    ctx.beginPath();ctx.arc(x,y+14*scaleY,12*scaleX,4*scaleY,0,0,6.3);ctx.fillStyle='rgba(0,0,0,0.3)';
+    ctx.beginPath();ctx.ellipse(x,y+15,12,5,0,0,6.3);ctx.fill();
+    ctx.fillStyle=me?'#e7c87e':'#ff5a26';
+    ctx.beginPath();ctx.arc(x,y,13,0,6.3);ctx.fill();
+    ctx.fillStyle='#100f0a';ctx.beginPath();ctx.arc(x,y,5,0,6.3);ctx.fill();
+    ctx.font='700 12px Oswald, sans-serif';ctx.textAlign='center';
+    ctx.fillStyle=me?'#e7c87e':'#ffae8c';
+    ctx.fillText((t.name||'?')+(me?' (you)':''),x,y-20);
+  }
+  // count
+  ctx.fillStyle='#9a9079';ctx.font='12px Space Mono, monospace';ctx.textAlign='right';
+  ctx.fillText(Object.keys(targets).length+' in the trench',cv.width-12,cv.height-12);
+  requestAnimationFrame(draw);
+}
+requestAnimationFrame(draw);
+})();
+</script>
+</body>
+</html>

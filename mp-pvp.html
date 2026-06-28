@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Trenchers — PvP Test</title>
+<link href="https://fonts.googleapis.com/css2?family=Oswald:wght@600;700&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">
+<style>
+  :root{--mud-900:#100f0a;--brass:#c89b4a;--brass-br:#e7c87e;--bone:#e8e0cc;--bone-dim:#9a9079;--flare:#ff5a26;--flare-gl:#ffae5c;--gain:#9bb04f;--blood:#c0392b;}
+  *{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent;}
+  html,body{height:100%;background:var(--mud-900);overflow:hidden;font-family:'Space Mono',monospace;color:var(--bone);}
+  body{display:flex;align-items:center;justify-content:center;touch-action:none;user-select:none;}
+  #wrap{position:relative;width:100vw;height:100vh;max-width:960px;max-height:560px;}
+  canvas{display:block;width:100%;height:100%;background:#16140d;cursor:crosshair;}
+  #status{position:absolute;top:8px;left:8px;z-index:5;font-size:11px;letter-spacing:1px;background:rgba(16,15,10,.85);border:1px solid rgba(200,155,74,.3);padding:5px 9px;}
+  #status .dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--flare);margin-right:6px;vertical-align:middle;}
+  #status.on .dot{background:var(--gain);}
+  #score{position:absolute;top:8px;right:8px;z-index:5;font-size:12px;background:rgba(16,15,10,.85);border:1px solid rgba(200,155,74,.3);padding:6px 10px;text-align:right;min-width:120px;}
+  #score .h{font-family:'Oswald';font-weight:700;font-size:10px;letter-spacing:2px;color:var(--bone-dim);margin-bottom:3px;}
+  #score .r{display:flex;justify-content:space-between;gap:14px;}
+  #banner{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);z-index:6;text-align:center;pointer-events:none;display:none;}
+  #banner .w{font-family:'Oswald';font-weight:700;font-size:clamp(30px,8vw,56px);letter-spacing:3px;color:var(--brass-br);text-shadow:0 3px 0 #000;}
+  #banner .s{font-size:12px;color:var(--bone-dim);letter-spacing:2px;margin-top:6px;}
+  #hint{position:absolute;bottom:8px;left:50%;transform:translateX(-50%);z-index:5;font-size:10px;color:var(--bone-dim);letter-spacing:1px;}
+  #lobby{position:absolute;inset:0;z-index:8;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;padding:24px;text-align:center;background:radial-gradient(ellipse at 50% 30%,rgba(40,36,22,.5),rgba(8,7,4,.95) 75%);}
+  #lobby.hidden{display:none;}
+  .title{font-family:'Oswald';font-weight:700;font-size:clamp(34px,9vw,60px);letter-spacing:3px;line-height:.9;}
+  .title .b{color:var(--brass-br);}
+  .sub{font-size:11px;color:var(--bone-dim);letter-spacing:1px;max-width:360px;line-height:1.7;}
+  input{background:#0c0b07;border:1px solid rgba(200,155,74,.4);color:var(--bone);font-family:'Space Mono';font-size:15px;padding:11px 14px;letter-spacing:2px;text-transform:uppercase;text-align:center;width:220px;}
+  .btn{cursor:pointer;font-family:'Oswald';font-weight:600;font-size:16px;letter-spacing:3px;color:var(--mud-900);background:var(--brass);border:none;padding:12px 30px;text-transform:uppercase;box-shadow:0 4px 0 #6e4f1d;}
+  .btn:active{transform:translateY(3px);box-shadow:0 1px 0 #6e4f1d;}
+  .err{color:var(--flare);font-size:11px;min-height:14px;}
+  .small{font-size:10px;color:var(--bone-dim);}
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="cv"></canvas>
+  <div id="status"><span class="dot"></span><span id="statusText">offline</span></div>
+  <div id="score"><div class="h">KILLS</div><div id="scoreRows"></div></div>
+  <div id="banner"><div class="w" id="bannerW"></div><div class="s" id="bannerS"></div></div>
+  <div id="hint">WASD move · mouse aim · hold CLICK / SPACE to fire · first to 5 kills wins</div>
+
+  <div id="lobby">
+    <div class="title">TREN<span class="b">CHERS</span> · PVP</div>
+    <div class="sub">Slice 2 — combat. Open in two windows, join the same room code, and shoot each other. First to 5 kills wins. Move with WASD, aim with the mouse, hold click or space to fire.</div>
+    <input id="nameIn" maxlength="16" placeholder="CALLSIGN" />
+    <input id="roomIn" maxlength="8" placeholder="ROOM CODE" />
+    <button class="btn" id="joinBtn">ENTER THE TRENCH</button>
+    <div class="err" id="err"></div>
+    <div class="small" id="urlNote"></div>
+  </div>
+</div>
+
+<script>
+(()=>{
+"use strict";
+// ===== CONFIG =====
+// Local: "ws://127.0.0.1:8000"   |   Railway (https): "wss://your-realtime.up.railway.app"
+const REALTIME_URL = "ws://127.0.0.1:8000";
+
+const cv=document.getElementById('cv'),ctx=cv.getContext('2d');
+let W=960,H=540,scaleX=1,scaleY=1;
+function resize(){const r=document.getElementById('wrap').getBoundingClientRect();cv.width=r.width;cv.height=r.height;scaleX=cv.width/W;scaleY=cv.height/H;}
+addEventListener('resize',resize);resize();
+
+let ws=null,myId=null,connected=false;
+let snap={players:[],bullets:[],phase:'play',winner:null,target:5};
+let render={}; // id -> eased {x,y}
+const keys={};
+const mouse={x:W/2,y:H/2,down:false};
+
+document.getElementById('urlNote').textContent='server: '+REALTIME_URL;
+function setStatus(t,on){document.getElementById('statusText').textContent=t;document.getElementById('status').classList.toggle('on',!!on);}
+
+function join(){
+  const room=(document.getElementById('roomIn').value||'').trim().toUpperCase();
+  const name=(document.getElementById('nameIn').value||'').trim();
+  const err=document.getElementById('err');
+  if(!room){err.textContent='enter a room code';return;}
+  err.textContent='';
+  const url=REALTIME_URL.replace(/\/$/,'')+'/ws/'+encodeURIComponent(room);
+  setStatus('connecting…',false);
+  try{ws=new WebSocket(url);}catch(e){err.textContent='bad server URL';return;}
+  ws.onopen=()=>{connected=true;setStatus('connected · room '+room,true);document.getElementById('lobby').classList.add('hidden');if(name)ws.send(JSON.stringify({t:'name',name}));startInputLoop();};
+  ws.onmessage=(ev)=>{let m;try{m=JSON.parse(ev.data);}catch(e){return;}
+    if(m.t==='welcome'){myId=m.id;W=m.w||W;H=m.h||H;resize();}
+    else if(m.t==='state'){snap=m;
+      const seen={};
+      for(const p of m.players){seen[p.id]=1;if(!render[p.id])render[p.id]={x:p.x,y:p.y};}
+      for(const id in render){if(!seen[id])delete render[id];}
+    } else if(m.t==='full'){document.getElementById('err').textContent='room is full';}
+  };
+  ws.onclose=()=>{connected=false;setStatus('disconnected',false);};
+  ws.onerror=()=>{document.getElementById('err').textContent='could not reach server — is it running?';setStatus('error',false);};
+}
+document.getElementById('joinBtn').addEventListener('click',join);
+
+let inputTimer=null;
+function startInputLoop(){
+  if(inputTimer)clearInterval(inputTimer);
+  inputTimer=setInterval(()=>{
+    if(!connected||!ws||ws.readyState!==1)return;
+    let dx=0,dy=0;
+    if(keys['w']||keys['arrowup'])dy-=1;
+    if(keys['s']||keys['arrowdown'])dy+=1;
+    if(keys['a']||keys['arrowleft'])dx-=1;
+    if(keys['d']||keys['arrowright'])dx+=1;
+    let aim=0;const me=render[myId];
+    if(me)aim=Math.atan2(mouse.y-me.y,mouse.x-me.x);
+    const fire=mouse.down||!!keys[' '];
+    ws.send(JSON.stringify({t:'input',dx,dy,aim,fire}));
+  },50);
+}
+
+addEventListener('keydown',e=>{keys[e.key.toLowerCase()]=true;if(e.key===' ')e.preventDefault();});
+addEventListener('keyup',e=>{keys[e.key.toLowerCase()]=false;});
+function rel(e){const r=cv.getBoundingClientRect();return{x:(e.clientX-r.left)/scaleX,y:(e.clientY-r.top)/scaleY};}
+cv.addEventListener('mousemove',e=>{const p=rel(e);mouse.x=p.x;mouse.y=p.y;});
+cv.addEventListener('mousedown',()=>{mouse.down=true;});
+addEventListener('mouseup',()=>{mouse.down=false;});
+
+function draw(){
+  ctx.clearRect(0,0,cv.width,cv.height);
+  ctx.strokeStyle='rgba(200,155,74,0.06)';ctx.lineWidth=1;
+  for(let x=0;x<=W;x+=48){ctx.beginPath();ctx.moveTo(x*scaleX,0);ctx.lineTo(x*scaleX,cv.height);ctx.stroke();}
+  for(let y=0;y<=H;y+=48){ctx.beginPath();ctx.moveTo(0,y*scaleY);ctx.lineTo(cv.width,y*scaleY);ctx.stroke();}
+
+  // bullets
+  ctx.fillStyle='#ffae5c';
+  for(const b of snap.bullets){ctx.beginPath();ctx.arc(b.x*scaleX,b.y*scaleY,3.5*scaleX,0,6.3);ctx.fill();}
+
+  // players
+  for(const p of snap.players){
+    if(!render[p.id])render[p.id]={x:p.x,y:p.y};
+    render[p.id].x+=(p.x-render[p.id].x)*0.35;
+    render[p.id].y+=(p.y-render[p.id].y)*0.35;
+    const x=render[p.id].x*scaleX,y=render[p.id].y*scaleY,me=(p.id===myId);
+    if(!p.alive){ctx.globalAlpha=0.35;ctx.fillStyle=me?'#e7c87e':'#ff5a26';ctx.beginPath();ctx.arc(x,y,13,0,6.3);ctx.fill();ctx.globalAlpha=1;
+      ctx.fillStyle='#9a9079';ctx.font='700 10px Oswald';ctx.textAlign='center';ctx.fillText('RESPAWNING',x,y-20);continue;}
+    // shadow
+    ctx.fillStyle='rgba(0,0,0,0.3)';ctx.beginPath();ctx.ellipse(x,y+15,12,5,0,0,6.3);ctx.fill();
+    // gun line toward aim
+    ctx.strokeStyle=me?'#e7c87e':'#ffae8c';ctx.lineWidth=4;ctx.beginPath();ctx.moveTo(x,y);ctx.lineTo(x+Math.cos(p.aim)*20,y+Math.sin(p.aim)*20);ctx.stroke();
+    // body
+    ctx.fillStyle=me?'#e7c87e':'#ff5a26';ctx.beginPath();ctx.arc(x,y,13,0,6.3);ctx.fill();
+    ctx.fillStyle='#100f0a';ctx.beginPath();ctx.arc(x,y,5,0,6.3);ctx.fill();
+    // hp bar
+    const hpw=30;ctx.fillStyle='#000';ctx.fillRect(x-hpw/2,y-26,hpw,4);
+    ctx.fillStyle=p.hp>40?'#9bb04f':'#c0392b';ctx.fillRect(x-hpw/2,y-26,hpw*Math.max(0,p.hp)/100,4);
+    // name
+    ctx.fillStyle=me?'#e7c87e':'#ffae8c';ctx.font='700 12px Oswald';ctx.textAlign='center';
+    ctx.fillText((p.name||'?')+(me?' (you)':''),x,y-31);
+  }
+
+  // scoreboard
+  const rows=[...snap.players].sort((a,b)=>b.kills-a.kills).map(p=>`<div class="r"><span>${p.name||'?'}${p.id===myId?' (you)':''}</span><b>${p.kills}</b></div>`).join('');
+  document.getElementById('scoreRows').innerHTML=rows||'<div class="r"><span>waiting…</span></div>';
+
+  // win banner
+  const bn=document.getElementById('banner');
+  if(snap.phase==='over'&&snap.winner){bn.style.display='block';document.getElementById('bannerW').textContent=snap.winner+' WINS';document.getElementById('bannerS').textContent='new round starting…';}
+  else bn.style.display='none';
+
+  requestAnimationFrame(draw);
+}
+requestAnimationFrame(draw);
+})();
+</script>
+</body>
+</html>
