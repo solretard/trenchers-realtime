@@ -102,6 +102,12 @@ const cv=document.getElementById('cv'),ctx=cv.getContext('2d');
 let W=1920,H=1080;                 // world size (updated from server welcome)
 const VIEW_W=960,VIEW_H=560;       // minimum world area kept visible
 let zoom=1,camX=W/2,camY=H/2;      // camera (follows local player)
+let COVER=[];                       // [[x,y,w,h]] from server
+const PLAYER_R=16;
+function blocked(px,py){
+  for(const c of COVER){if(px>=c[0]-PLAYER_R&&px<=c[0]+c[2]+PLAYER_R&&py>=c[1]-PLAYER_R&&py<=c[1]+c[3]+PLAYER_R)return true;}
+  return false;
+}
 function resize(){const r=document.getElementById('wrap').getBoundingClientRect();cv.width=r.width;cv.height=r.height;zoom=Math.min(cv.width/VIEW_W,cv.height/VIEW_H);ctx.imageSmoothingEnabled=false;}
 addEventListener('resize',resize);resize();
 // world -> screen
@@ -196,7 +202,7 @@ function join(){
   try{ws=new WebSocket(url);}catch(e){err.textContent='bad server URL';return;}
   ws.onopen=()=>{connected=true;setStatus('connected · room '+room,true);document.getElementById('lobby').classList.add('hidden');document.getElementById('war').style.display='block';if(name)ws.send(JSON.stringify({t:'name',name}));ws.send(JSON.stringify({t:'faction',f:myFaction}));startInputLoop();};
   ws.onmessage=(ev)=>{let m;try{m=JSON.parse(ev.data);}catch(e){return;}
-    if(m.t==='welcome'){myId=m.id;W=m.w||W;H=m.h||H;resize();}
+    if(m.t==='welcome'){myId=m.id;W=m.w||W;H=m.h||H;COVER=m.cover||[];resize();}
     else if(m.t==='state'){onState(m);}
     else if(m.t==='full'){document.getElementById('err').textContent='room is full';}
   };
@@ -273,8 +279,10 @@ function onState(m){
       pred={x:p.x,y:p.y};
       if(p.alive){
         for(const i of pending){
-          pred.x=clampx(pred.x+i.dx*SPEED*MOVE_STEP);
-          pred.y=clampy(pred.y+i.dy*SPEED*MOVE_STEP);
+          const cx=clampx(pred.x+i.dx*SPEED*MOVE_STEP);
+          if(!blocked(cx,pred.y))pred.x=cx;
+          const cy=clampy(pred.y+i.dy*SPEED*MOVE_STEP);
+          if(!blocked(pred.x,cy))pred.y=cy;
         }
       } else { pending=[]; }
     } else {
@@ -330,11 +338,13 @@ function startInputLoop(){
     myFiring=fire;
     inputSeq++;
     ws.send(JSON.stringify({t:'input',seq:inputSeq,dx,dy,aim,fire}));
-    // ----- client-side prediction: move myself now -----
+    // ----- client-side prediction: move myself now (with cover collision) -----
     if(pred&&myAlive){
       let nx=dx,ny=dy;const mg=Math.hypot(nx,ny);if(mg>1){nx/=mg;ny/=mg;}
-      pred.x=clampx(pred.x+nx*SPEED*MOVE_STEP);
-      pred.y=clampy(pred.y+ny*SPEED*MOVE_STEP);
+      const cx=clampx(pred.x+nx*SPEED*MOVE_STEP);
+      if(!blocked(cx,pred.y))pred.x=cx;
+      const cy=clampy(pred.y+ny*SPEED*MOVE_STEP);
+      if(!blocked(pred.x,cy))pred.y=cy;
       pending.push({seq:inputSeq,dx:nx,dy:ny});
       if(pending.length>120)pending.shift();
     }
@@ -398,6 +408,16 @@ function drawFloor(){
   // world boundary wall
   ctx.strokeStyle='rgba(200,155,74,0.45)';ctx.lineWidth=4;ctx.strokeRect(sx(0),sy(0),W*zoom,H*zoom);
 }
+function drawCover(){
+  for(const c of COVER){
+    const x=sx(c[0]),y=sy(c[1]),w=c[2]*zoom,h=c[3]*zoom;
+    ctx.fillStyle='#0c0b07';ctx.fillRect(x-2,y-2,w+4,h+4);          // dark base/shadow
+    ctx.fillStyle='#3a3326';ctx.fillRect(x,y,w,h);                  // crate body
+    ctx.fillStyle='#4d4433';ctx.fillRect(x,y,w,Math.max(3,h*0.28)); // lit top edge
+    ctx.strokeStyle='#5e5238';ctx.lineWidth=Math.max(1,2*zoom);ctx.strokeRect(x,y,w,h);
+    ctx.fillStyle='rgba(200,155,74,0.18)';ctx.fillRect(x+w*0.5-1,y+3,2,h-6); // brace
+  }
+}
 function drawHero(spr,x,y,s,aim){
   const w=spr.width*s,h=spr.height*s;ctx.save();ctx.translate(Math.round(x),Math.round(y));
   if(Math.cos(aim)<0)ctx.scale(-1,1);ctx.drawImage(spr,-w/2,-h/2,w,h);ctx.restore();
@@ -448,6 +468,7 @@ function draw(){
   ctx.save();
   if(shake>0){ctx.translate((Math.random()-0.5)*shake,(Math.random()-0.5)*shake);shake*=0.86;if(shake<0.4)shake=0;}
   drawFloor();
+  drawCover();
 
   const now=performance.now();
   // bullets: glowing tracers in owner's faction color, extrapolated

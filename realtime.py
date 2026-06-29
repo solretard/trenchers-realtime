@@ -80,6 +80,33 @@ def clampx(v): return min(W - 16, max(16, v))
 def clampy(v): return min(H - 16, max(16, v))
 
 
+# --- cover: rectangles (x, y, w, h) in world space, identical for every client ---
+# symmetric layout so neither side has an advantage
+COVER = [
+    (300, 250, 150, 46), (1470, 250, 150, 46),
+    (300, 784, 150, 46), (1470, 784, 150, 46),
+    (170, 500, 46, 170), (1704, 500, 46, 170),
+    (840, 170, 240, 46), (840, 864, 240, 46),
+    (600, 470, 46, 200), (1274, 470, 46, 200),
+    (900, 480, 120, 120),
+]
+PLAYER_R = 16
+
+
+def blocked(px, py):
+    for (ox, oy, ow, oh) in COVER:
+        if ox - PLAYER_R <= px <= ox + ow + PLAYER_R and oy - PLAYER_R <= py <= oy + oh + PLAYER_R:
+            return True
+    return False
+
+
+def in_cover(px, py):
+    for (ox, oy, ow, oh) in COVER:
+        if ox <= px <= ox + ow and oy <= py <= oy + oh:
+            return True
+    return False
+
+
 class Token:
     def __init__(self, sym):
         self.sym = sym
@@ -124,8 +151,13 @@ class Player:
         self.chosen_faction: Optional[str] = None
 
     def spawn(self):
-        self.x = clampx(random.uniform(120, W - 120))
-        self.y = clampy(random.uniform(120, H - 120))
+        for _ in range(30):
+            nx = clampx(random.uniform(120, W - 120))
+            ny = clampy(random.uniform(120, H - 120))
+            if not blocked(nx, ny):
+                break
+        self.x = nx
+        self.y = ny
         self.hp = MAX_HP
         self.alive = True
         self.fire_cd = 0.0
@@ -182,8 +214,12 @@ def apply_input(room, p, dx, dy, aim, fire, seq):
     if mag > 1:
         dx /= mag; dy /= mag
     if p.alive:
-        p.x = clampx(p.x + dx * SPEED * MOVE_STEP)
-        p.y = clampy(p.y + dy * SPEED * MOVE_STEP)
+        nx = clampx(p.x + dx * SPEED * MOVE_STEP)
+        if not blocked(nx, p.y):
+            p.x = nx
+        ny = clampy(p.y + dy * SPEED * MOVE_STEP)
+        if not blocked(p.x, ny):
+            p.y = ny
     p.aim = aim
     if fire and p.alive and room.phase == "play" and p.fire_cd <= 0:
         gun = player_gun(room, p)
@@ -227,6 +263,8 @@ def step_room(room: Room):
         b["y"] += b["vy"] * DT
         b["life"] -= DT
         if b["life"] <= 0 or b["x"] < -20 or b["x"] > W + 20 or b["y"] < -20 or b["y"] > H + 20:
+            continue
+        if in_cover(b["x"], b["y"]):
             continue
         hit = False
         for p in room.players.values():
@@ -338,7 +376,8 @@ async def ws_endpoint(ws: WebSocket, code: str):
     pid = uuid.uuid4().hex[:8]
     player = Player(pid, "trencher-" + pid[:4], ws)
     room.players[pid] = player
-    await ws.send_text(json.dumps({"t": "welcome", "id": pid, "room": room.code, "w": W, "h": H}))
+    await ws.send_text(json.dumps({"t": "welcome", "id": pid, "room": room.code, "w": W, "h": H,
+                                   "cover": [list(c) for c in COVER]}))
     try:
         while True:
             raw = await ws.receive_text()
