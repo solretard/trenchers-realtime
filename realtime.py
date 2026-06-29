@@ -28,7 +28,7 @@ TICK_HZ = 30
 DT = 1.0 / TICK_HZ
 SPEED = 230.0
 MOVE_STEP = 1.0 / 30.0
-W, H = 960, 540
+W, H = 1920, 1080
 MAX_PLAYERS = 8
 
 MAX_HP = 100
@@ -193,6 +193,7 @@ def apply_input(room, p, dx, dy, aim, fire, seq):
             a = aim + (random.uniform(-spread, spread) if spread else 0.0)
             room.bullets.append({
                 "o": p.id,
+                "fac": resolve_faction(p),
                 "x": p.x + math.cos(a) * 18,
                 "y": p.y + math.sin(a) * 18,
                 "vx": math.cos(a) * BULLET_SPEED,
@@ -275,7 +276,7 @@ def room_state(room: Room) -> str:
         ],
         "bullets": [
             {"x": round(b["x"], 1), "y": round(b["y"], 1),
-             "vx": round(b["vx"], 1), "vy": round(b["vy"], 1)}
+             "vx": round(b["vx"], 1), "vy": round(b["vy"], 1), "fac": b.get("fac")}
             for b in room.bullets
         ],
     })
