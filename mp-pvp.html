@@ -2,15 +2,20 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-<title>Trenchers — PvP Test</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Trenchers">
+<title>Trenchers — PvP</title>
 <link href="https://fonts.googleapis.com/css2?family=Oswald:wght@600;700&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">
 <style>
   :root{--mud-900:#100f0a;--brass:#c89b4a;--brass-br:#e7c87e;--bone:#e8e0cc;--bone-dim:#9a9079;--flare:#ff5a26;--flare-gl:#ffae5c;--gain:#9bb04f;--blood:#c0392b;}
   *{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent;}
   html,body{height:100%;background:var(--mud-900);overflow:hidden;font-family:'Space Mono',monospace;color:var(--bone);}
-  body{display:flex;align-items:center;justify-content:center;touch-action:none;user-select:none;}
-  #wrap{position:relative;width:100vw;height:100vh;max-width:960px;max-height:560px;}
+  body{display:flex;align-items:center;justify-content:center;touch-action:none;user-select:none;height:100vh;height:100dvh;}
+  #wrap{position:relative;width:100vw;height:100vh;width:100dvw;height:100dvh;}
+  @media (min-width:980px){#wrap{max-width:960px;max-height:560px;}}
   canvas{display:block;width:100%;height:100%;background:#16140d;cursor:crosshair;image-rendering:pixelated;}
   #vig{position:absolute;inset:0;pointer-events:none;z-index:4;background:radial-gradient(ellipse 80% 70% at 50% 48%,transparent 44%,rgba(8,7,4,.5) 100%);box-shadow:inset 0 0 110px rgba(0,0,0,.6);}
   #dmgflash{position:absolute;inset:0;pointer-events:none;z-index:4;opacity:0;mix-blend-mode:screen;background:#ff5a26;transition:opacity .08s;}
@@ -41,6 +46,19 @@
   .fchip{cursor:pointer;border:1px solid rgba(200,155,74,.4);background:#0c0b07;color:var(--bone);font-family:'Oswald';font-weight:600;font-size:12px;letter-spacing:1px;padding:7px 13px;}
   .fchip.sel{color:#100f0a;}
   #waiting{position:absolute;inset:0;z-index:7;display:none;flex-direction:column;align-items:center;justify-content:center;gap:16px;text-align:center;background:radial-gradient(ellipse at 50% 40%,rgba(40,36,22,.55),rgba(8,7,4,.93) 75%);}
+  /* ---- mobile: shrink + declutter so the play area stays clear ---- */
+  @media (max-width:900px), (pointer:coarse){
+    #hint{display:none;}
+    #status{font-size:9px;padding:3px 6px;top:4px;left:4px;}
+    #score{font-size:10px;padding:4px 7px;min-width:96px;top:4px;right:4px;}
+    #score .h{font-size:8px;}
+    #war{font-size:9px;padding:4px 6px;min-width:96px;margin-top:22px;left:4px;}
+    #war .h{font-size:8px;}
+    #market{top:32px;bottom:auto;left:50%;right:auto;transform:translateX(-50%);max-width:60%;flex-wrap:nowrap;overflow-x:auto;justify-content:flex-start;gap:4px;padding-bottom:2px;}
+    .tok{min-width:50px;padding:3px 5px;flex:0 0 auto;}
+    .tok .sym{font-size:9px;}.tok .mc{font-size:8px;}.tok .gt{font-size:7px;}
+    #gun{bottom:4px;top:auto;left:50%;font-size:11px;}
+  }
   #waiting .wt{font-family:'Oswald';font-weight:700;font-size:clamp(22px,6vw,38px);letter-spacing:3px;color:var(--brass-br);}
   #waiting .wr{font-size:12px;color:var(--bone-dim);letter-spacing:3px;}
   #waiting .pulse{font-size:11px;color:var(--bone-dim);letter-spacing:2px;animation:bl 1.3s ease-in-out infinite;}
@@ -163,7 +181,15 @@ let mouseFire=false;               // desktop: left button held
 let moveStick={id:null,ox:0,oy:0,cx:0,cy:0};        // touch: left stick
 let aimStick={id:null,ox:0,oy:0,cx:0,cy:0,active:false}; // touch: right stick
 const STICK_MAX=52;                // px radius for stick travel
-const ASSIST_ANGLE=0.30;           // radians of auto-aim assist
+const GRAB_ANGLE=0.30;             // tight cone to first lock onto a target
+const RELEASE_ANGLE=0.55;          // wider cone before the lock lets go (hysteresis)
+let aimLockId=null;                // currently locked target id (sticky)
+// local visual tracers (fix B): shots drawn from the predicted barrel so they
+// always leave your gun while moving; server bullets stay authoritative for hits.
+let localBullets=[];
+let localFireT=0, lastTick=performance.now();
+const GUN_CD=[0.42,0.13,0.28,0.20,0.70], GUN_PEL=[1,1,1,1,5], GUN_SPR=[0,0.05,0,0,0.34];
+function inCoverPt(px,py){for(const c of COVER){if(px>=c[0]&&px<=c[0]+c[2]&&py>=c[1]&&py<=c[1]+c[3])return true;}return false;}
 let myFiring=false;                // for muzzle flash
 let shake=0;                       // screen shake amount
 let myHpPrev=100;                  // detect damage for flash
@@ -323,17 +349,21 @@ function startInputLoop(){
       aim=Math.atan2(mouseW.y-pred.y,mouseW.x-pred.x); // desktop: gun tracks cursor
       fire=mouseFire;                             // fire only while click held
     }
-    // light auto-aim assist: if roughly pointed at an enemy, snap onto it
+    // ---- sticky auto-aim: lock a target, hold it until it leaves a wider cone ----
     if(fire&&pred){
-      let best=ASSIST_ANGLE, lock=null;
-      for(const p of lastPlayers){
-        if(p.id===myId||!p.alive)continue;
-        const ang=Math.atan2(p.y-pred.y,p.x-pred.x);
-        let d=ang-aim; while(d>Math.PI)d-=2*Math.PI; while(d<-Math.PI)d+=2*Math.PI;
-        if(Math.abs(d)<best){best=Math.abs(d);lock=ang;}
+      const angTo=p=>Math.atan2(p.y-pred.y,p.x-pred.x);
+      const diff=(a,b)=>{let d=a-b;while(d>Math.PI)d-=6.283185;while(d<-Math.PI)d+=6.283185;return Math.abs(d);};
+      let locked=aimLockId?lastPlayers.find(p=>p.id===aimLockId&&p.alive&&p.id!==myId):null;
+      if(locked){
+        if(diff(angTo(locked),aim)<=RELEASE_ANGLE)aim=angTo(locked);   // hold lock
+        else{aimLockId=null;locked=null;}                              // released
       }
-      if(lock!==null)aim=lock;
-    }
+      if(!locked){                                                     // try to grab nearest-to-aim
+        let best=GRAB_ANGLE,pick=null;
+        for(const t of lastPlayers){if(t.id===myId||!t.alive)continue;const d=diff(angTo(t),aim);if(d<best){best=d;pick=t;}}
+        if(pick){aimLockId=pick.id;aim=angTo(pick);}
+      }
+    } else { aimLockId=null; }                                         // release when not firing
     myAim=aim;
     myFiring=fire;
     inputSeq++;
@@ -411,11 +441,13 @@ function drawFloor(){
 function drawCover(){
   for(const c of COVER){
     const x=sx(c[0]),y=sy(c[1]),w=c[2]*zoom,h=c[3]*zoom;
-    ctx.fillStyle='#0c0b07';ctx.fillRect(x-2,y-2,w+4,h+4);          // dark base/shadow
-    ctx.fillStyle='#3a3326';ctx.fillRect(x,y,w,h);                  // crate body
-    ctx.fillStyle='#4d4433';ctx.fillRect(x,y,w,Math.max(3,h*0.28)); // lit top edge
-    ctx.strokeStyle='#5e5238';ctx.lineWidth=Math.max(1,2*zoom);ctx.strokeRect(x,y,w,h);
-    ctx.fillStyle='rgba(200,155,74,0.18)';ctx.fillRect(x+w*0.5-1,y+3,2,h-6); // brace
+    ctx.fillStyle='rgba(0,0,0,0.55)';ctx.fillRect(x-3,y+3,w+6,h+4);                 // drop shadow
+    ctx.fillStyle='#6b5836';ctx.fillRect(x,y,w,h);                                  // warm wood body
+    ctx.fillStyle='#8a7245';ctx.fillRect(x,y,w,Math.max(4,h*0.30));                 // lit top
+    ctx.fillStyle='#4a3c24';ctx.fillRect(x,y+h-Math.max(3,h*0.18),w,Math.max(3,h*0.18)); // dark bottom
+    ctx.strokeStyle='#c89b4a';ctx.lineWidth=Math.max(1.5,2*zoom);ctx.strokeRect(x+1,y+1,w-2,h-2); // brass trim
+    ctx.fillStyle='rgba(231,200,126,0.5)';ctx.fillRect(x+w*0.5-1,y+2,2,h-4);        // brace
+    ctx.fillRect(x+2,y+h*0.5-1,w-4,2);
   }
 }
 function drawHero(spr,x,y,s,aim){
@@ -471,17 +503,28 @@ function draw(){
   drawCover();
 
   const now=performance.now();
+  let fdt=(now-lastTick)/1000; if(fdt>0.05)fdt=0.05; lastTick=now;
+  const meP=lastPlayers.find(p=>p.id===myId);
+  // spawn local tracers from my predicted barrel, matching gun cadence
+  localFireT-=fdt;
+  if(myFiring&&pred&&meP&&meP.alive&&meP.tier>=0&&localFireT<=0){
+    const tier=meP.tier,cd=GUN_CD[tier]||0.4,pel=GUN_PEL[tier]||1,spr=GUN_SPR[tier]||0;
+    localFireT=cd;const tip=18,fac=meP.faction;
+    for(let k=0;k<pel;k++){const a=myAim+(spr?(Math.random()-0.5)*spr*2:0);
+      localBullets.push({x:pred.x+Math.cos(a)*tip,y:pred.y+Math.sin(a)*tip,vx:Math.cos(a)*540,vy:Math.sin(a)*540,life:2.4,fac});}
+  }
+  // advance local tracers
+  for(let i=localBullets.length-1;i>=0;i--){const b=localBullets[i];b.x+=b.vx*fdt;b.y+=b.vy*fdt;b.life-=fdt;
+    if(b.life<=0||b.x<-20||b.x>W+20||b.y<-20||b.y>H+20||inCoverPt(b.x,b.y))localBullets.splice(i,1);}
+
   // bullets: glowing tracers in owner's faction color, extrapolated
   const dtb=Math.min(0.12,(now-bulletSet.t)/1000);
-  for(const b of bulletSet.list){
-    const bx=sx(b.x+(b.vx||0)*dtb), by=sy(b.y+(b.vy||0)*dtb), ang=Math.atan2(b.vy||0,b.vx||1);
-    const c=FCOLOR[b.fac]||'#ff7a2c';
-    ctx.save();ctx.translate(bx,by);ctx.rotate(ang);
-    ctx.shadowColor=c;ctx.shadowBlur=8;
-    ctx.fillStyle=c;ctx.fillRect(-2*zoom,-2*zoom,12*zoom,4*zoom);
-    ctx.fillStyle='#fff';ctx.fillRect(-4*zoom,-1*zoom,6*zoom,2*zoom);
-    ctx.restore();
-  }
+  const drawTracer=(wx,wy,vx,vy,fac)=>{const bx=sx(wx),by=sy(wy),ang=Math.atan2(vy||0,vx||1),c=FCOLOR[fac]||'#ff7a2c';
+    ctx.save();ctx.translate(bx,by);ctx.rotate(ang);ctx.shadowColor=c;ctx.shadowBlur=8;
+    ctx.fillStyle=c;ctx.fillRect(-2*zoom,-2*zoom,12*zoom,4*zoom);ctx.fillStyle='#fff';ctx.fillRect(-4*zoom,-1*zoom,6*zoom,2*zoom);ctx.restore();};
+  for(const b of bulletSet.list){ if(b.o===myId)continue;            // hide my own server bullets (shown as local tracers)
+    drawTracer(b.x+(b.vx||0)*dtb,b.y+(b.vy||0)*dtb,b.vx,b.vy,b.fac); }
+  for(const b of localBullets){ drawTracer(b.x,b.y,b.vx,b.vy,b.fac); }
   ctx.shadowBlur=0;
 
   const rt=now-INTERP_DELAY;

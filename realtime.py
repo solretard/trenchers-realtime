@@ -314,7 +314,7 @@ def room_state(room: Room) -> str:
         ],
         "bullets": [
             {"x": round(b["x"], 1), "y": round(b["y"], 1),
-             "vx": round(b["vx"], 1), "vy": round(b["vy"], 1), "fac": b.get("fac")}
+             "vx": round(b["vx"], 1), "vy": round(b["vy"], 1), "fac": b.get("fac"), "o": b["o"]}
             for b in room.bullets
         ],
     })
