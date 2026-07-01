@@ -28,7 +28,9 @@ TICK_HZ = 30
 DT = 1.0 / TICK_HZ
 SPEED = 230.0
 MOVE_STEP = 1.0 / 30.0
-W, H = 960, 540
+PADX, PADY = 480, 300           # buffer border so the camera can keep you centered to the wall
+PLAY_W, PLAY_H = 1600, 1000     # arena matched to Survive mode
+W, H = PLAY_W + 2 * PADX, PLAY_H + 2 * PADY   # world incl. buffer (2880 x 1680)
 MAX_PLAYERS = 8
 
 MAX_HP = 100
@@ -76,8 +78,37 @@ def resolve_faction(player) -> str:
     return player.chosen_faction or "—"
 
 
-def clampx(v): return min(W - 16, max(16, v))
-def clampy(v): return min(H - 16, max(16, v))
+def clampx(v): return min(W - PADX, max(PADX, v))
+def clampy(v): return min(H - PADY, max(PADY, v))
+
+
+# --- cover: rectangles (x, y, w, h) in world space, identical for every client ---
+# symmetric layout so neither side has an advantage
+COVER = [
+    (px + PADX, py + PADY, cw, ch) for (px, py, cw, ch) in [
+        (250, 230, 130, 40), (1220, 230, 130, 40),
+        (250, 730, 130, 40), (1220, 730, 130, 40),
+        (140, 425, 40, 150), (1420, 425, 40, 150),
+        (700, 150, 200, 40), (700, 810, 200, 40),
+        (500, 415, 40, 170), (1060, 415, 40, 170),
+        (750, 440, 100, 100),
+    ]
+]
+PLAYER_R = 16
+
+
+def blocked(px, py):
+    for (ox, oy, ow, oh) in COVER:
+        if ox - PLAYER_R <= px <= ox + ow + PLAYER_R and oy - PLAYER_R <= py <= oy + oh + PLAYER_R:
+            return True
+    return False
+
+
+def in_cover(px, py):
+    for (ox, oy, ow, oh) in COVER:
+        if ox <= px <= ox + ow and oy <= py <= oy + oh:
+            return True
+    return False
 
 
 class Token:
@@ -111,8 +142,8 @@ class Player:
         self.id = pid
         self.name = name
         self.ws = ws
-        self.x = clampx(random.uniform(120, W - 120))
-        self.y = clampy(random.uniform(120, H - 120))
+        self.x = clampx(random.uniform(PADX + 60, W - PADX - 60))
+        self.y = clampy(random.uniform(PADY + 60, H - PADY - 60))
         self.aim = 0.0
         self.hp = MAX_HP
         self.alive = True
@@ -122,10 +153,16 @@ class Player:
         self.last_seq = 0
         self.equipped: Optional[str] = None
         self.chosen_faction: Optional[str] = None
+        self.loadout: Optional[int] = None   # starting gun tier (0..2) chosen in loadout screen
 
     def spawn(self):
-        self.x = clampx(random.uniform(120, W - 120))
-        self.y = clampy(random.uniform(120, H - 120))
+        for _ in range(30):
+            nx = clampx(random.uniform(PADX + 60, W - PADX - 60))
+            ny = clampy(random.uniform(PADY + 60, H - PADY - 60))
+            if not blocked(nx, ny):
+                break
+        self.x = nx
+        self.y = ny
         self.hp = MAX_HP
         self.alive = True
         self.fire_cd = 0.0
@@ -166,6 +203,8 @@ def player_gun(room: Room, p: Player) -> dict:
         tok = room.market.get(p.equipped)
         if tok and not tok.rugged:
             return GUNS[tier_of(tok.mcap)]
+    if p.loadout is not None:
+        return GUNS[p.loadout]
     return DEFAULT_GUN
 
 
@@ -182,8 +221,12 @@ def apply_input(room, p, dx, dy, aim, fire, seq):
     if mag > 1:
         dx /= mag; dy /= mag
     if p.alive:
-        p.x = clampx(p.x + dx * SPEED * MOVE_STEP)
-        p.y = clampy(p.y + dy * SPEED * MOVE_STEP)
+        nx = clampx(p.x + dx * SPEED * MOVE_STEP)
+        if not blocked(nx, p.y):
+            p.x = nx
+        ny = clampy(p.y + dy * SPEED * MOVE_STEP)
+        if not blocked(p.x, ny):
+            p.y = ny
     p.aim = aim
     if fire and p.alive and room.phase == "play" and p.fire_cd <= 0:
         gun = player_gun(room, p)
@@ -193,6 +236,7 @@ def apply_input(room, p, dx, dy, aim, fire, seq):
             a = aim + (random.uniform(-spread, spread) if spread else 0.0)
             room.bullets.append({
                 "o": p.id,
+                "fac": resolve_faction(p),
                 "x": p.x + math.cos(a) * 18,
                 "y": p.y + math.sin(a) * 18,
                 "vx": math.cos(a) * BULLET_SPEED,
@@ -226,6 +270,8 @@ def step_room(room: Room):
         b["y"] += b["vy"] * DT
         b["life"] -= DT
         if b["life"] <= 0 or b["x"] < -20 or b["x"] > W + 20 or b["y"] < -20 or b["y"] > H + 20:
+            continue
+        if in_cover(b["x"], b["y"]):
             continue
         hit = False
         for p in room.players.values():
@@ -275,7 +321,7 @@ def room_state(room: Room) -> str:
         ],
         "bullets": [
             {"x": round(b["x"], 1), "y": round(b["y"], 1),
-             "vx": round(b["vx"], 1), "vy": round(b["vy"], 1)}
+             "vx": round(b["vx"], 1), "vy": round(b["vy"], 1), "fac": b.get("fac"), "o": b["o"]}
             for b in room.bullets
         ],
     })
@@ -337,7 +383,9 @@ async def ws_endpoint(ws: WebSocket, code: str):
     pid = uuid.uuid4().hex[:8]
     player = Player(pid, "trencher-" + pid[:4], ws)
     room.players[pid] = player
-    await ws.send_text(json.dumps({"t": "welcome", "id": pid, "room": room.code, "w": W, "h": H}))
+    await ws.send_text(json.dumps({"t": "welcome", "id": pid, "room": room.code, "w": W, "h": H,
+                                   "padx": PADX, "pady": PADY,
+                                   "cover": [list(c) for c in COVER]}))
     try:
         while True:
             raw = await ws.receive_text()
@@ -364,6 +412,12 @@ async def ws_endpoint(ws: WebSocket, code: str):
                 f = str(m.get("f", "")).upper()
                 if f in FACTIONS:
                     player.chosen_faction = f
+            elif kind == "loadout":
+                try:
+                    t = int(m.get("tier", 0))
+                except (TypeError, ValueError):
+                    t = 0
+                player.loadout = max(0, min(2, t))   # only PISTOL/SMG/RIFLE allowed as start
             elif kind == "name":
                 nm = str(m.get("name", ""))[:16].strip()
                 if nm:
