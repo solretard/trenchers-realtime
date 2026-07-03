@@ -154,6 +154,7 @@ class Player:
         self.equipped: Optional[str] = None
         self.chosen_faction: Optional[str] = None
         self.loadout: Optional[int] = None   # starting gun tier (0..2) chosen in loadout screen
+        self.moved_tick = False               # anti-speedhack: one movement step per tick
 
     def spawn(self):
         for _ in range(30):
@@ -217,10 +218,15 @@ def player_tier(room: Room, p: Player) -> int:
 
 
 def apply_input(room, p, dx, dy, aim, fire, seq):
+    # reject non-finite values (NaN/inf) — a hacked client could send these to corrupt state
+    if not (math.isfinite(dx) and math.isfinite(dy) and math.isfinite(aim)):
+        return
     mag = (dx * dx + dy * dy) ** 0.5
     if mag > 1:
         dx /= mag; dy /= mag
-    if p.alive:
+    # cap movement to ONE step per server tick, so flooding inputs can't speed-hack
+    if p.alive and not p.moved_tick:
+        p.moved_tick = True
         nx = clampx(p.x + dx * SPEED * MOVE_STEP)
         if not blocked(nx, p.y):
             p.x = nx
@@ -257,6 +263,7 @@ def step_room(room: Room):
         tok.step()
 
     for p in room.players.values():
+        p.moved_tick = False   # allow one movement step this tick
         if p.fire_cd > 0:
             p.fire_cd -= DT
         if not p.alive:
