@@ -154,7 +154,8 @@ class Player:
         self.equipped: Optional[str] = None
         self.chosen_faction: Optional[str] = None
         self.loadout: Optional[int] = None   # starting gun tier (0..2) chosen in loadout screen
-        self.moved_tick = False               # anti-speedhack: one movement step per tick
+        self.mdx = 0.0                        # latest desired move direction (applied per tick)
+        self.mdy = 0.0
 
     def spawn(self):
         for _ in range(30):
@@ -225,14 +226,12 @@ def apply_input(room, p, dx, dy, aim, fire, seq):
     if mag > 1:
         dx /= mag; dy /= mag
     # cap movement to ONE step per server tick, so flooding inputs can't speed-hack
-    if p.alive and not p.moved_tick:
-        p.moved_tick = True
-        nx = clampx(p.x + dx * SPEED * MOVE_STEP)
-        if not blocked(nx, p.y):
-            p.x = nx
-        ny = clampy(p.y + dy * SPEED * MOVE_STEP)
-        if not blocked(p.x, ny):
-            p.y = ny
+    # store the LATEST desired direction; actual movement happens once per tick
+    # in step_room. this decouples movement from input message rate (smooth) and
+    # keeps it exactly one step per tick (no speed-hacking).
+    if p.alive:
+        p.mdx = dx
+        p.mdy = dy
     p.aim = aim
     if fire and p.alive and room.phase == "play" and p.fire_cd <= 0:
         gun = player_gun(room, p)
@@ -263,10 +262,18 @@ def step_room(room: Room):
         tok.step()
 
     for p in room.players.values():
-        p.moved_tick = False   # allow one movement step this tick
         if p.fire_cd > 0:
             p.fire_cd -= DT
-        if not p.alive:
+        if p.alive:
+            # one smooth movement step per tick from the latest input direction
+            if p.mdx or p.mdy:
+                nx = clampx(p.x + p.mdx * SPEED * MOVE_STEP)
+                if not blocked(nx, p.y):
+                    p.x = nx
+                ny = clampy(p.y + p.mdy * SPEED * MOVE_STEP)
+                if not blocked(p.x, ny):
+                    p.y = ny
+        else:
             p.respawn -= DT
             if p.respawn <= 0:
                 p.spawn()
