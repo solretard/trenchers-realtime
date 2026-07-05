@@ -17,6 +17,7 @@ import asyncio
 import json
 import math
 import random
+import time
 import uuid
 from contextlib import asynccontextmanager
 from typing import Dict, List, Optional
@@ -28,6 +29,7 @@ TICK_HZ = 30
 DT = 1.0 / TICK_HZ
 SPEED = 230.0
 MOVE_STEP = 1.0 / 30.0
+MAX_INPUTS_PER_SEC = 45   # legit clients send ~30/sec; cap flooding without throttling honest play
 PADX, PADY = 480, 300           # buffer border so the camera can keep you centered to the wall
 PLAY_W, PLAY_H = 1600, 1000     # arena matched to Survive mode
 W, H = PLAY_W + 2 * PADX, PLAY_H + 2 * PADY   # world incl. buffer (2880 x 1680)
@@ -154,8 +156,7 @@ class Player:
         self.equipped: Optional[str] = None
         self.chosen_faction: Optional[str] = None
         self.loadout: Optional[int] = None   # starting gun tier (0..2) chosen in loadout screen
-        self.mdx = 0.0                        # latest desired move direction (applied per tick)
-        self.mdy = 0.0
+        self.input_times = []                 # timestamps for input-rate limiting (anti speed-hack)
 
     def spawn(self):
         for _ in range(30):
@@ -222,16 +223,25 @@ def apply_input(room, p, dx, dy, aim, fire, seq):
     # reject non-finite values (NaN/inf) — a hacked client could send these to corrupt state
     if not (math.isfinite(dx) and math.isfinite(dy) and math.isfinite(aim)):
         return
+    # rate-limit inputs per player: legit clients send ~30/sec, so a generous cap
+    # stops speed-hack input-flooding without ever throttling honest movement.
+    now = time.monotonic()
+    p.input_times.append(now)
+    cutoff = now - 1.0
+    while p.input_times and p.input_times[0] < cutoff:
+        p.input_times.pop(0)
+    flooding = len(p.input_times) > MAX_INPUTS_PER_SEC
     mag = (dx * dx + dy * dy) ** 0.5
     if mag > 1:
         dx /= mag; dy /= mag
-    # cap movement to ONE step per server tick, so flooding inputs can't speed-hack
-    # store the LATEST desired direction; actual movement happens once per tick
-    # in step_room. this decouples movement from input message rate (smooth) and
-    # keeps it exactly one step per tick (no speed-hacking).
-    if p.alive:
-        p.mdx = dx
-        p.mdy = dy
+    # move one step per input (matches client-side prediction → smooth, no rubber-banding)
+    if p.alive and not flooding:
+        nx = clampx(p.x + dx * SPEED * MOVE_STEP)
+        if not blocked(nx, p.y):
+            p.x = nx
+        ny = clampy(p.y + dy * SPEED * MOVE_STEP)
+        if not blocked(p.x, ny):
+            p.y = ny
     p.aim = aim
     if fire and p.alive and room.phase == "play" and p.fire_cd <= 0:
         gun = player_gun(room, p)
@@ -264,16 +274,7 @@ def step_room(room: Room):
     for p in room.players.values():
         if p.fire_cd > 0:
             p.fire_cd -= DT
-        if p.alive:
-            # one smooth movement step per tick from the latest input direction
-            if p.mdx or p.mdy:
-                nx = clampx(p.x + p.mdx * SPEED * MOVE_STEP)
-                if not blocked(nx, p.y):
-                    p.x = nx
-                ny = clampy(p.y + p.mdy * SPEED * MOVE_STEP)
-                if not blocked(p.x, ny):
-                    p.y = ny
-        else:
+        if not p.alive:
             p.respawn -= DT
             if p.respawn <= 0:
                 p.spawn()
