@@ -38,7 +38,7 @@ MAX_PLAYERS = 8
 MAX_HP = 100
 BULLET_SPEED = 540.0
 BULLET_LIFE = 2.4
-PLAYER_HIT_R = 18.0
+PLAYER_HIT_R = 22.0   # matches the on-screen character body (18x21 sprite @ 3x); was 18 (bullets clipped the visible body but missed)
 RESPAWN = 2.0
 TARGET_KILLS = 5
 RESET_DELAY = 5.0
@@ -262,6 +262,21 @@ def apply_input(room, p, dx, dy, aim, fire, seq):
     p.last_seq = seq
 
 
+def seg_point_dist2(ax, ay, bx, by, px, py):
+    """Squared distance from point (px,py) to the segment (ax,ay)->(bx,by)."""
+    dx, dy = bx - ax, by - ay
+    seg2 = dx * dx + dy * dy
+    if seg2 == 0.0:
+        return (px - ax) ** 2 + (py - ay) ** 2
+    t = ((px - ax) * dx + (py - ay) * dy) / seg2
+    if t < 0.0:
+        t = 0.0
+    elif t > 1.0:
+        t = 1.0
+    cx, cy = ax + t * dx, ay + t * dy
+    return (px - cx) ** 2 + (py - cy) ** 2
+
+
 def step_room(room: Room):
     if room.phase == "over":
         room.reset_timer -= DT
@@ -281,18 +296,22 @@ def step_room(room: Room):
 
     alive_bullets = []
     for b in room.bullets:
-        b["x"] += b["vx"] * DT
-        b["y"] += b["vy"] * DT
+        ox, oy = b["x"], b["y"]                 # where the bullet was
+        nx = ox + b["vx"] * DT
+        ny = oy + b["vy"] * DT                  # where it moves to this tick
+        b["x"], b["y"] = nx, ny
         b["life"] -= DT
-        if b["life"] <= 0 or b["x"] < -20 or b["x"] > W + 20 or b["y"] < -20 or b["y"] > H + 20:
+        if b["life"] <= 0 or nx < -20 or nx > W + 20 or ny < -20 or ny > H + 20:
             continue
-        if in_cover(b["x"], b["y"]):
+        if in_cover(nx, ny):
             continue
         hit = False
         for p in room.players.values():
             if not p.alive or p.id == b["o"]:
                 continue
-            if (p.x - b["x"]) ** 2 + (p.y - b["y"]) ** 2 <= PLAYER_HIT_R ** 2:
+            # swept hit-test: distance from the player to the segment the bullet
+            # travelled this tick — catches fast bullets that would skip over a player
+            if seg_point_dist2(ox, oy, nx, ny, p.x, p.y) <= PLAYER_HIT_R ** 2:
                 p.hp -= b["dmg"]
                 hit = True
                 if p.hp <= 0:
