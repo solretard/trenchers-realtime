@@ -315,8 +315,14 @@ def apply_input(room, p, dx, dy, aim, fire, seq, bomb=False):
 
 
 def step_room(room: Room):
-    # ---- authoritative waiting gate: match only runs with 2+ players ----
-    live_count = len(room.players)
+    # ---- authoritative waiting gate: match only runs with 2+ ACTIVE players ----
+    # count only players who've sent input recently — a lingering/half-closed socket
+    # from a reload stops sending input, so it won't falsely trip the gate.
+    now_m = time.monotonic()
+    live_count = sum(
+        1 for p in room.players.values()
+        if p.input_times and (now_m - p.input_times[-1]) <= 3.0
+    )
     if live_count < 2:
         # not enough players — hold in "waiting", freeze combat/pickups/bombs
         if room.phase != "waiting":
