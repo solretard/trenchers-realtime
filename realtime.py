@@ -196,7 +196,7 @@ class Room:
         self.code = code
         self.players: Dict[str, Player] = {}
         self.bullets: List[dict] = []
-        self.phase = "play"
+        self.phase = "waiting"
         self.winner = None
         self.reset_timer = 0.0
         self.market: Dict[str, Token] = {s: Token(s) for s in MARKET_SYMS}
@@ -315,6 +315,27 @@ def apply_input(room, p, dx, dy, aim, fire, seq, bomb=False):
 
 
 def step_room(room: Room):
+    # ---- authoritative waiting gate: match only runs with 2+ players ----
+    live_count = len(room.players)
+    if live_count < 2:
+        # not enough players — hold in "waiting", freeze combat/pickups/bombs
+        if room.phase != "waiting":
+            room.phase = "waiting"
+            room.bullets.clear()
+            room.bombs.clear()
+            room.pickups.clear()
+            room.pickup_timers = {"shield": 30.0, "heal": 60.0, "gun": 90.0}
+        # keep the lone player idle-alive so they see the arena behind the overlay
+        for p in room.players.values():
+            if not p.alive:
+                p.respawn -= DT
+                if p.respawn <= 0:
+                    p.spawn()
+        return
+    if room.phase == "waiting":
+        # a second player just arrived — kick off a fresh match
+        room.reset_match()
+
     if room.phase == "over":
         room.reset_timer -= DT
         if room.reset_timer <= 0:
