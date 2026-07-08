@@ -522,8 +522,15 @@ async def ticker():
             room = rooms.get(code)
             if not room or not room.players:
                 continue
-            step_room(room)
-            msg = room_state(room)
+            try:
+                step_room(room)
+                msg = room_state(room)
+            except Exception as e:
+                # never let one room's error kill the game loop for everyone
+                import traceback
+                print("step_room error in room", code, ":", e)
+                traceback.print_exc()
+                continue
             dead = []
             for p in list(room.players.values()):
                 try:
