@@ -620,8 +620,10 @@ async def ws_endpoint(ws: WebSocket, code: str):
                     player.name = nm
     except WebSocketDisconnect:
         pass
-    except Exception:
-        pass
+    except Exception as e:
+        import traceback
+        print("WS connection error for", pid, "in room", code, ":", repr(e))
+        traceback.print_exc()
     finally:
         room.players.pop(pid, None)
         if not room.players:
