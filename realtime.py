@@ -300,6 +300,9 @@ def apply_input(room, p, dx, dy, aim, fire, seq, bomb=False):
             "fuse": BOMB_FUSE,
         })
     p.last_seq = seq
+
+
+def seg_point_dist2(ax, ay, bx, by, px, py):
     """Squared distance from point (px,py) to the segment (ax,ay)->(bx,by)."""
     dx, dy = bx - ax, by - ay
     seg2 = dx * dx + dy * dy
