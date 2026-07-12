@@ -16,9 +16,36 @@ Protocol additions
 import asyncio
 import json
 import math
+import os
 import random
+import re
+import threading
 import time
 import uuid
+import urllib.request
+
+# --- reporting PvP wins to the backend (for XP) ---
+# The backend credits 100 XP per win. The shared secret proves the call came from
+# this server (PvP results are server-authoritative here) and not from a browser.
+BACKEND_URL = os.environ.get("BACKEND_URL", "").rstrip("/")
+PVP_SECRET = os.environ.get("PVP_SECRET", "").strip()
+WALLET_RE = re.compile(r"^r[1-9A-HJ-NP-Za-km-z]{24,34}$")
+
+
+def report_win(wallet: str):
+    """Fire-and-forget: tell the backend this wallet won a PvP match."""
+    if not (BACKEND_URL and PVP_SECRET and wallet and WALLET_RE.match(wallet)):
+        return
+    def _post():
+        try:
+            data = json.dumps({"wallet": wallet, "secret": PVP_SECRET}).encode()
+            req = urllib.request.Request(
+                BACKEND_URL + "/pvp/win", data=data,
+                headers={"Content-Type": "application/json"}, method="POST")
+            urllib.request.urlopen(req, timeout=5).read()
+        except Exception as e:
+            print("report_win failed:", repr(e))
+    threading.Thread(target=_post, daemon=True).start()
 from contextlib import asynccontextmanager
 from typing import Dict, List, Optional
 
@@ -158,6 +185,7 @@ class Player:
     def __init__(self, pid, name, ws):
         self.id = pid
         self.name = name
+        self.wallet = None                    # XRPL wallet (for XP credit on a win)
         self.ws = ws
         self.x = clampx(random.uniform(PADX + 60, W - PADX - 60))
         self.y = clampy(random.uniform(PADY + 60, H - PADY - 60))
@@ -434,6 +462,7 @@ def step_room(room: Room):
                                 fac = resolve_faction(shooter)
                                 if fac in room.war:
                                     room.war[fac] += 1
+                                report_win(shooter.wallet)   # +100 XP
             room.blasts = getattr(room, "blasts", [])
             room.blasts.append({"x": bomb["x"], "y": bomb["y"], "t": 0.35})
         else:
@@ -477,6 +506,7 @@ def step_room(room: Room):
                             fac = resolve_faction(shooter)
                             if fac in room.war:
                                 room.war[fac] += 1
+                            report_win(shooter.wallet)   # +100 XP
                 break
         if not hit:
             alive_bullets.append(b)
@@ -621,6 +651,10 @@ async def ws_endpoint(ws: WebSocket, code: str):
                 nm = str(m.get("name", ""))[:16].strip()
                 if nm:
                     player.name = nm
+            elif kind == "wallet":
+                w = str(m.get("wallet", "")).strip()
+                if WALLET_RE.match(w):
+                    player.wallet = w
     except WebSocketDisconnect:
         pass
     except Exception as e:
