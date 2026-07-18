@@ -54,6 +54,9 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 # --- core tunables (client mirrors SPEED and MOVE_STEP) ---
 TICK_HZ = 30
 DT = 1.0 / TICK_HZ
+# Drop a client we haven't heard from in this long. Real clients send input
+# constantly, so silence means the connection is dead even if it never closed.
+PLAYER_TIMEOUT = 12.0
 SPEED = 230.0
 MOVE_STEP = 1.0 / 30.0
 MAX_INPUTS_PER_SEC = 45   # legit clients send ~30/sec; cap flooding without throttling honest play
@@ -196,6 +199,10 @@ class Player:
         self.fire_cd = 0.0
         self.respawn = 0.0
         self.last_seq = 0
+        # Last time we heard anything from this client. A socket can die without
+        # raising (phone sleeps, network drops, tab killed), which used to leave a
+        # frozen "trencher-xxxx" standing in the room forever.
+        self.last_seen = time.time()
         self.equipped: Optional[str] = None
         self.chosen_faction: Optional[str] = None
         self.loadout: Optional[int] = None   # starting gun tier (0..2) chosen in loadout screen
@@ -551,9 +558,25 @@ def room_state(room: Room) -> str:
 async def ticker():
     while True:
         await asyncio.sleep(DT)
+        now = time.time()
         for code in list(rooms.keys()):
             room = rooms.get(code)
             if not room or not room.players:
+                continue
+            # Evict clients we haven't heard from — a dead socket doesn't always
+            # raise, and a stuck player left a phantom "trencher" in the match.
+            stale = [pid for pid, p in room.players.items()
+                     if now - getattr(p, "last_seen", now) > PLAYER_TIMEOUT]
+            for pid in stale:
+                gone = room.players.pop(pid, None)
+                if gone:
+                    print(f"dropped stale player {gone.name} ({pid[:6]}) from room {code}")
+                    try:
+                        await gone.ws.close()
+                    except Exception:
+                        pass
+            if not room.players:
+                rooms.pop(code, None)
                 continue
             try:
                 step_room(room)
@@ -617,6 +640,7 @@ async def ws_endpoint(ws: WebSocket, code: str):
     try:
         while True:
             raw = await ws.receive_text()
+            player.last_seen = time.time()      # proof this client is still alive
             try:
                 m = json.loads(raw)
             except Exception:
