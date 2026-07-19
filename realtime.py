@@ -318,7 +318,7 @@ class Player:
                 break
         self.x = nx
         self.y = ny
-        self.hp = MAX_HP
+        self.hp = class_of(self).get("hp", MAX_HP)
         self.alive = True
         self.fire_cd = 0.0
         self.shield_until = 0.0               # lose shield on death
@@ -402,11 +402,12 @@ def apply_input(room, p, dx, dy, aim, fire, seq, bomb=False):
     # move one step per input (matches client-side prediction → smooth, no rubber-banding)
     if p.alive and not flooding:
         cspd = SPEED * class_of(p)["spd"]
+        stuck = blocked(p.x, p.y, room.cover)      # already inside geometry?
         nx = clampx(p.x + dx * cspd * MOVE_STEP)
-        if not blocked(nx, p.y, room.cover):
+        if stuck or not blocked(nx, p.y, room.cover):
             p.x = nx
         ny = clampy(p.y + dy * cspd * MOVE_STEP)
-        if not blocked(p.x, ny, room.cover):
+        if stuck or not blocked(p.x, ny, room.cover):
             p.y = ny
     p.aim = aim
     if fire and p.alive and room.phase == "play" and p.fire_cd <= 0:
@@ -741,6 +742,7 @@ async def ws_endpoint(ws: WebSocket, code: str):
     is_host = len(room.players) == 0        # first one in picks the map
     player = Player(pid, "trencher-" + pid[:4], ws)
     room.players[pid] = player
+    player.spawn(room.cover)          # place on clear ground for THIS room's map
 
     # Host may name a map via ?map=... ; everyone else just gets whatever the room is on.
     if is_host:
