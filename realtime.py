@@ -131,28 +131,55 @@ def clampy(v): return min(H - PADY, max(PADY, v))
 
 # --- cover: rectangles (x, y, w, h) in world space, identical for every client ---
 # symmetric layout so neither side has an advantage
-COVER = [
-    (px + PADX, py + PADY, cw, ch) for (px, py, cw, ch) in [
+def _mk(defs):
+    return [(px + PADX, py + PADY, cw, ch) for (px, py, cw, ch) in defs]
+
+# Three maps the host can pick between. Each plays differently:
+MAPS = {
+    # Open ground, long sightlines, cover clustered at the corners and centre.
+    "trenchline": _mk([
         (250, 230, 130, 40), (1220, 230, 130, 40),
         (250, 730, 130, 40), (1220, 730, 130, 40),
         (140, 425, 40, 150), (1420, 425, 40, 150),
         (700, 150, 200, 40), (700, 810, 200, 40),
         (500, 415, 40, 170), (1060, 415, 40, 170),
         (750, 440, 100, 100),
-    ]
-]
+    ]),
+    # Tight corridors and blind corners — brawls, ambushes, short range.
+    "warren": _mk([
+        (200, 160, 40, 260), (200, 580, 40, 260),
+        (1360, 160, 40, 260), (1360, 580, 40, 260),
+        (380, 300, 260, 40), (960, 300, 260, 40),
+        (380, 660, 260, 40), (960, 660, 260, 40),
+        (620, 420, 40, 160), (940, 420, 40, 160),
+        (760, 120, 40, 200), (760, 680, 40, 200),
+        (500, 480, 180, 40), (920, 480, 180, 40),
+    ]),
+    # Big open arena with scattered pillars — movement duels, few safe spots.
+    "the pit": _mk([
+        (420, 240, 60, 60), (1120, 240, 60, 60),
+        (420, 700, 60, 60), (1120, 700, 60, 60),
+        (770, 180, 60, 60), (770, 760, 60, 60),
+        (270, 470, 60, 60), (1310, 470, 60, 60),
+        (600, 400, 60, 60), (960, 400, 60, 60),
+        (600, 600, 60, 60), (960, 600, 60, 60),
+        (760, 480, 80, 80),
+    ]),
+}
+DEFAULT_MAP = "trenchline"
+COVER = MAPS[DEFAULT_MAP]     # fallback for anything not room-aware
 PLAYER_R = 16
 
 
-def blocked(px, py):
-    for (ox, oy, ow, oh) in COVER:
+def blocked(px, py, cover=None):
+    for (ox, oy, ow, oh) in (cover if cover is not None else COVER):
         if ox - PLAYER_R <= px <= ox + ow + PLAYER_R and oy - PLAYER_R <= py <= oy + oh + PLAYER_R:
             return True
     return False
 
 
-def in_cover(px, py):
-    for (ox, oy, ow, oh) in COVER:
+def in_cover(px, py, cover=None):
+    for (ox, oy, ow, oh) in (cover if cover is not None else COVER):
         if ox <= px <= ox + ow and oy <= py <= oy + oh:
             return True
     return False
@@ -211,11 +238,11 @@ class Player:
         self.power_until = 0.0                # server-time until which the power gun is held
         self.bomb_cd = 0.0                    # bomb cooldown remaining
 
-    def spawn(self):
+    def spawn(self, cover=None):
         for _ in range(30):
             nx = clampx(random.uniform(PADX + 60, W - PADX - 60))
             ny = clampy(random.uniform(PADY + 60, H - PADY - 60))
-            if not blocked(nx, ny):
+            if not blocked(nx, ny, cover):
                 break
         self.x = nx
         self.y = ny
@@ -239,6 +266,8 @@ class Room:
         self.pickups: List[dict] = []                      # active {id,kind,x,y}
         self.pickup_timers = {"shield": 30.0, "heal": 60.0, "gun": 90.0}  # staggered first spawns
         self.bombs: List[dict] = []
+        self.map_name = DEFAULT_MAP          # host picks this when the room is created
+        self.cover = MAPS[DEFAULT_MAP]
         self._pid = 0
 
     def reset_match(self):
@@ -250,7 +279,7 @@ class Room:
         self.winner = None
         for p in self.players.values():
             p.kills = 0
-            p.spawn()
+            p.spawn(room.cover)
 
 
 rooms: Dict[str, Room] = {}
@@ -301,10 +330,10 @@ def apply_input(room, p, dx, dy, aim, fire, seq, bomb=False):
     # move one step per input (matches client-side prediction → smooth, no rubber-banding)
     if p.alive and not flooding:
         nx = clampx(p.x + dx * SPEED * MOVE_STEP)
-        if not blocked(nx, p.y):
+        if not blocked(nx, p.y, room.cover):
             p.x = nx
         ny = clampy(p.y + dy * SPEED * MOVE_STEP)
-        if not blocked(p.x, ny):
+        if not blocked(p.x, ny, room.cover):
             p.y = ny
     p.aim = aim
     if fire and p.alive and room.phase == "play" and p.fire_cd <= 0:
@@ -374,7 +403,7 @@ def step_room(room: Room):
             if not p.alive:
                 p.respawn -= DT
                 if p.respawn <= 0:
-                    p.spawn()
+                    p.spawn(room.cover)
         return
     if room.phase == "waiting":
         # a second player just arrived — kick off a fresh match
@@ -396,7 +425,7 @@ def step_room(room: Room):
         if not p.alive:
             p.respawn -= DT
             if p.respawn <= 0:
-                p.spawn()
+                p.spawn(room.cover)
 
     # ---- pickups: spawn one of each kind every PICKUP_INTERVAL; first player to touch grabs it ----
     if room.phase == "play":
@@ -407,7 +436,7 @@ def step_room(room: Room):
                 for _ in range(30):
                     px = clampx(random.uniform(PADX + 60, W - PADX - 60))
                     py = clampy(random.uniform(PADY + 60, H - PADY - 60))
-                    if not blocked(px, py):
+                    if not blocked(px, py, room.cover):
                         break
                 room._pid += 1
                 room.pickups.append({"id": room._pid, "kind": kind, "x": px, "y": py})
@@ -439,7 +468,7 @@ def step_room(room: Room):
         bomb["x"] += bomb["vx"] * DT
         bomb["y"] += bomb["vy"] * DT
         bomb["fuse"] -= DT
-        exploded = bomb["fuse"] <= 0 or in_cover(bomb["x"], bomb["y"]) \
+        exploded = bomb["fuse"] <= 0 or in_cover(bomb["x"], bomb["y"], room.cover) \
             or bomb["x"] < 0 or bomb["x"] > W or bomb["y"] < 0 or bomb["y"] > H
         if not exploded:
             for p in room.players.values():
@@ -487,7 +516,7 @@ def step_room(room: Room):
         b["life"] -= DT
         if b["life"] <= 0 or nx < -20 or nx > W + 20 or ny < -20 or ny > H + 20:
             continue
-        if in_cover(nx, ny):
+        if in_cover(nx, ny, room.cover):
             continue
         hit = False
         for p in room.players.values():
@@ -632,11 +661,22 @@ async def ws_endpoint(ws: WebSocket, code: str):
         await ws.close()
         return
     pid = uuid.uuid4().hex[:8]
+    is_host = len(room.players) == 0        # first one in picks the map
     player = Player(pid, "trencher-" + pid[:4], ws)
     room.players[pid] = player
+
+    # Host may name a map via ?map=... ; everyone else just gets whatever the room is on.
+    if is_host:
+        want = (ws.query_params.get("map") or "").strip().lower()
+        if want in MAPS:
+            room.map_name = want
+            room.cover = MAPS[want]
+
     await ws.send_text(json.dumps({"t": "welcome", "id": pid, "room": room.code, "w": W, "h": H,
                                    "padx": PADX, "pady": PADY,
-                                   "cover": [list(c) for c in COVER]}))
+                                   "host": is_host, "map": room.map_name,
+                                   "maps": list(MAPS.keys()),
+                                   "cover": [list(c) for c in room.cover]}))
     try:
         while True:
             raw = await ws.receive_text()
