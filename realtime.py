@@ -46,6 +46,30 @@ def report_win(wallet: str):
         except Exception as e:
             print("report_win failed:", repr(e))
     threading.Thread(target=_post, daemon=True).start()
+
+
+def verify_nft_async(player, wallet: str):
+    """Ask the backend whether this wallet holds a Trenchers NFT.
+
+    Checked on the SERVER, not the client: in PvP a class advantage affects the
+    other player, so it can't be left to a value the browser sends us.
+    """
+    if not (BACKEND_URL and wallet and WALLET_RE.match(wallet)):
+        return
+
+    def _check():
+        try:
+            with urllib.request.urlopen(
+                    BACKEND_URL + "/nft/holder/" + wallet, timeout=6) as r:
+                d = json.loads(r.read().decode())
+            player.nft_ok = bool(d.get("holder"))
+            # if they'd already asked for a gated class, honour it now
+            if not player.nft_ok and PVP_CLASSES.get(player.cls, {}).get("gated"):
+                player.cls = FREE_CLASS
+                player.hp = PVP_CLASSES[FREE_CLASS]["hp"]
+        except Exception as e:
+            print("nft check failed:", repr(e))
+    threading.Thread(target=_check, daemon=True).start()
 from contextlib import asynccontextmanager
 from typing import Dict, List, Optional
 
@@ -66,6 +90,21 @@ W, H = PLAY_W + 2 * PADX, PLAY_H + 2 * PADY   # world incl. buffer (2880 x 1680)
 MAX_PLAYERS = 8
 
 MAX_HP = 100
+
+# --- PvP classes. APER is free; DIAMOND and SNIPER need a Trenchers NFT. ---
+# Deliberately tighter than the Solo numbers: in Solo a huge buff only affects your
+# own run, but here it decides fights against other people. Holders get a real edge
+# without making a skilled free player unable to win.
+PVP_CLASSES = {
+    "aper":    {"name": "APER",    "hp": 100, "spd": 1.00, "dmg": 1.00, "cd": 1.00, "gated": False},
+    "diamond": {"name": "DIAMOND", "hp": 165, "spd": 0.88, "dmg": 1.15, "cd": 1.00, "gated": True},
+    "sniper":  {"name": "SNIPER",  "hp":  85, "spd": 0.96, "dmg": 1.40, "cd": 1.15, "gated": True},
+}
+FREE_CLASS = "aper"
+
+
+def class_of(p):
+    return PVP_CLASSES.get(getattr(p, "cls", FREE_CLASS), PVP_CLASSES[FREE_CLASS])
 BULLET_SPEED = 540.0
 BULLET_LIFE = 2.4
 PLAYER_HIT_R = 22.0   # matches the on-screen character body (18x21 sprite @ 3x); was 18 (bullets clipped the visible body but missed)
@@ -220,7 +259,7 @@ class Player:
         self.x = clampx(random.uniform(PADX + 60, W - PADX - 60))
         self.y = clampy(random.uniform(PADY + 60, H - PADY - 60))
         self.aim = 0.0
-        self.hp = MAX_HP
+        self.hp = class_of(self).get("hp", MAX_HP)
         self.alive = True
         self.kills = 0
         self.fire_cd = 0.0
@@ -232,6 +271,8 @@ class Player:
         self.last_seen = time.time()
         self.equipped: Optional[str] = None
         self.chosen_faction: Optional[str] = None
+        self.cls = FREE_CLASS          # gated classes need a verified NFT
+        self.nft_ok = False            # set once the backend confirms holdings
         self.loadout: Optional[int] = None   # starting gun tier (0..2) chosen in loadout screen
         self.input_times = []                 # timestamps for input-rate limiting (anti speed-hack)
         self.shield_until = 0.0               # server-time until which shield is active
@@ -329,28 +370,33 @@ def apply_input(room, p, dx, dy, aim, fire, seq, bomb=False):
         dx /= mag; dy /= mag
     # move one step per input (matches client-side prediction → smooth, no rubber-banding)
     if p.alive and not flooding:
-        nx = clampx(p.x + dx * SPEED * MOVE_STEP)
+        cspd = SPEED * class_of(p)["spd"]
+        nx = clampx(p.x + dx * cspd * MOVE_STEP)
         if not blocked(nx, p.y, room.cover):
             p.x = nx
-        ny = clampy(p.y + dy * SPEED * MOVE_STEP)
+        ny = clampy(p.y + dy * cspd * MOVE_STEP)
         if not blocked(p.x, ny, room.cover):
             p.y = ny
     p.aim = aim
     if fire and p.alive and room.phase == "play" and p.fire_cd <= 0:
         gun = player_gun(room, p)
-        p.fire_cd = gun["cd"]
+        K = class_of(p)
+        p.fire_cd = gun["cd"] * K["cd"]
         for k in range(gun["pellets"]):
             spread = gun["spread"]
             a = aim + (random.uniform(-spread, spread) if spread else 0.0)
             room.bullets.append({
                 "o": p.id,
                 "fac": resolve_faction(p),
+                "cls": getattr(p, "cls", FREE_CLASS),
+                "spd": class_of(p)["spd"],
+                "mhp": class_of(p)["hp"],
                 "x": p.x + math.cos(a) * 18,
                 "y": p.y + math.sin(a) * 18,
                 "vx": math.cos(a) * BULLET_SPEED,
                 "vy": math.sin(a) * BULLET_SPEED,
                 "life": BULLET_LIFE,
-                "dmg": gun["dmg"],
+                "dmg": gun["dmg"] * K["dmg"],
             })
     # bomb throw: aim + press, 15s cooldown, spawns an AoE projectile
     if bomb and p.alive and room.phase == "play" and p.bomb_cd <= 0:
@@ -719,6 +765,16 @@ async def ws_endpoint(ws: WebSocket, code: str):
                 w = str(m.get("wallet", "")).strip()
                 if WALLET_RE.match(w):
                     player.wallet = w
+                    verify_nft_async(player, w)
+            elif kind == "class":
+                want = str(m.get("cls", "")).lower().strip()
+                if want in PVP_CLASSES:
+                    if PVP_CLASSES[want]["gated"] and not player.nft_ok:
+                        want = FREE_CLASS          # no verified NFT: silently stays APER
+                    player.cls = want
+                    if player.alive:
+                        player.hp = min(player.hp, PVP_CLASSES[want]["hp"]) \
+                                    if player.hp > PVP_CLASSES[want]["hp"] else PVP_CLASSES[want]["hp"]
     except WebSocketDisconnect:
         pass
     except Exception as e:
