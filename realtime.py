@@ -32,6 +32,37 @@ PVP_SECRET = os.environ.get("PVP_SECRET", "").strip()
 WALLET_RE = re.compile(r"^r[1-9A-HJ-NP-Za-km-z]{24,34}$")
 
 
+def award_win(room, winner):
+    """Credit a PvP win — but only when it was earned against someone else.
+
+    Without this a player could open the invite link in a second tab, sign in with
+    the same wallet, and farm 100 XP a round against themselves. XP converts to real
+    tokens through the airdrop, so this has to be shut off at the source.
+    """
+    w = getattr(winner, "wallet", None)
+    if not w:
+        return
+    others = [p for p in room.players.values()
+              if p is not winner and getattr(p, "wallet", None)]
+    # every other wallet in the room is the same as the winner's -> self-play
+    if others and all(p.wallet == w for p in others):
+        print(f"self-play blocked in room {room.code}: {w[:8]}… beat itself")
+        for p in room.players.values():
+            try:
+                asyncio.create_task(p.ws.send_text(json.dumps({
+                    "t": "noxp",
+                    "msg": "No XP awarded — both players are using the same wallet."
+                })))
+            except Exception:
+                pass
+        return
+    if not others:
+        print(f"no XP in room {room.code}: opponent has no wallet connected")
+        return                      # nobody else identified: nothing to credit against
+    print(f"XP awarded in room {room.code} to {w[:8]}…")
+    report_win(w)
+
+
 def report_win(wallet: str):
     """Fire-and-forget: tell the backend this wallet won a PvP match."""
     if not (BACKEND_URL and PVP_SECRET and wallet and WALLET_RE.match(wallet)):
@@ -544,7 +575,7 @@ def step_room(room: Room):
                                 fac = resolve_faction(shooter)
                                 if fac in room.war:
                                     room.war[fac] += 1
-                                report_win(shooter.wallet)   # +100 XP
+                                award_win(room, shooter)   # +100 XP (blocked on self-play)
             room.blasts = getattr(room, "blasts", [])
             room.blasts.append({"x": bomb["x"], "y": bomb["y"], "t": 0.35})
         else:
@@ -588,7 +619,7 @@ def step_room(room: Room):
                             fac = resolve_faction(shooter)
                             if fac in room.war:
                                 room.war[fac] += 1
-                            report_win(shooter.wallet)   # +100 XP
+                            award_win(room, shooter)   # +100 XP (blocked on self-play)
                 break
         if not hit:
             alive_bullets.append(b)
@@ -765,7 +796,25 @@ async def ws_endpoint(ws: WebSocket, code: str):
                 w = str(m.get("wallet", "")).strip()
                 if WALLET_RE.match(w):
                     player.wallet = w
+                    others_here = [p.wallet for p in room.players.values()
+                                   if p is not player and getattr(p, "wallet", None)]
+                    print(f"wallet set in room {room.code}: {w[:8]}… "
+                          f"(others here: {[o[:8] + '…' for o in others_here]})")
                     verify_nft_async(player, w)
+                    # Tell them straight away if someone else here is on the same
+                    # wallet, so it's clear before they play a whole round for nothing.
+                    twins = [p for p in room.players.values()
+                             if p is not player and getattr(p, "wallet", None) == w]
+                    if twins:
+                        warn = json.dumps({
+                            "t": "noxp",
+                            "msg": "Same wallet already in this room — no XP will be awarded."
+                        })
+                        for p in twins + [player]:
+                            try:
+                                await p.ws.send_text(warn)
+                            except Exception:
+                                pass
             elif kind == "class":
                 want = str(m.get("cls", "")).lower().strip()
                 if want in PVP_CLASSES:
